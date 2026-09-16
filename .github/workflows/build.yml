@@ -1,0 +1,33 @@
+name: Build VST3
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release -- /clp:ErrorsOnly;Summary
+
+      - name: Collect the .vst3
+        shell: pwsh
+        run: |
+          $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" -Directory | Select-Object -First 1
+          if (-not $vst) { $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" | Select-Object -First 1 }
+          New-Item -ItemType Directory -Force -Path artifact | Out-Null
+          Copy-Item -Recurse -Force $vst.FullName artifact/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PD-VST3
+          path: artifact
