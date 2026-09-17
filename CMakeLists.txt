@@ -32,6 +32,8 @@ target_sources(PD PRIVATE
     Source/PluginEditor.cpp
 )
 
+juce_generate_juce_header(PD)
+
 target_compile_definitions(PD PUBLIC
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
