@@ -60,10 +60,17 @@ public:
     // ---- Volume curve: a handful of (x = fraction of measure, y = gain multiplier) control points,
     // smoothly interpolated (smootherstep between segments) - drag-editable in the UI (y only, for
     // now; x positions are fixed anchors, matching "3 preset shapes" rather than free-form points).
+    // FIX (found while investigating "doesn't reset to flat"): this used to be process-global static
+    // data - a) shared across every open instance of the plugin (editing the curve in one instance
+    // silently changed every other open instance too), and b) never saved or loaded with the project
+    // at all, so a reload wasn't restoring the "flat" default - it was just showing whatever the last
+    // edit anywhere in this DAW session left behind. It's real per-instance state now, and is written
+    // to/read from getStateInformation()/setStateInformation() below.
     struct VolumePoint { float x, y; };
     static constexpr int kMaxVolumePoints = 6;
     struct VolumeCurve { int count=0; VolumePoint points[kMaxVolumePoints]{}; };
-    static VolumeCurve& getVolumeCurve(int index); // mutable - the UI edits this directly (y values)
+    VolumeCurve volumeCurves[3]; // per-instance, editable, saved with the project
+    static VolumeCurve defaultVolumeCurve(int index); // the flat-start factory default for each slot
     static float evalVolumeCurve(const VolumeCurve&, float x);
 
 private:
@@ -86,7 +93,7 @@ private:
     int grainWritePos = 0;
     bool grainArmed = false;
 
-    struct PendingTap { juce::int64 startSample; float gain; juce::int64 triggerSample; };
+    struct PendingTap { juce::int64 startSample; float gain; juce::int64 triggerSample; juce::int64 maxLenSamples; };
     struct ActiveTap { int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f; };
     std::vector<PendingTap> pendingTaps;
     std::vector<ActiveTap> activeTaps;
