@@ -24,8 +24,12 @@ PDAudioProcessor::~PDAudioProcessor(){}
 juce::AudioProcessorValueTreeState::ParameterLayout PDAudioProcessor::createParameterLayout(){
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
     ps.push_back(std::make_unique<juce::AudioParameterBool>(pBypass,"Bypass",false));
+    // FIX (requested): "Pattern 1/2/3" were meaningless placeholders from before the pattern itself
+    // was finalized. Now that it is, this same parameter becomes the real preset switch: Forward (the
+    // tuned build-up-then-rest pattern) and Reverse (the same shape mirrored - rest, then build into
+    // the next downbeat). Two real, named choices instead of three placeholder ones.
     ps.push_back(std::make_unique<juce::AudioParameterChoice>(pPattern,"Pattern",
-        juce::StringArray{"Pattern 1","Pattern 2","Pattern 3"},0));
+        juce::StringArray{"Forward","Reverse"},0));
     ps.push_back(std::make_unique<juce::AudioParameterChoice>(pVolumeCurve,"Volume Curve",
         juce::StringArray{"Curve 1","Curve 2","Curve 3"},0));
     ps.push_back(std::make_unique<juce::AudioParameterFloat>(pGrainMs,"Grain Length",
@@ -51,36 +55,47 @@ void PDAudioProcessor::prepareToPlay(double sampleRate,int){
 // FIX (requested): after listening, the hand-extracted pattern didn't sound good and the clean
 // exponential-deceleration pattern did - so for now there is only ONE real pattern (this one),
 // occupying every slot, until the redesigned preset panel replaces this whole mechanism.
-static PDAudioProcessor::Pattern buildTheOnlyPattern(){
+static PDAudioProcessor::Pattern buildForwardPattern(){
     PDAudioProcessor::Pattern pat{};
-    // FIX (requested - "reach perfection" pass, A/B'd against a 4-measure ours/reference/ours/
-    // reference reference file at 120 BPM): the last tap used to land at 96.5% of the measure - only
-    // ~31ms before the next measure, measured in the actual rendered audio at 98.5% (close enough to
-    // the intended 96.5% once the tap's own short decay is counted). The reference's last audible tap
-    // lands at 89.5%, leaving ~211ms of clear space before the next measure - about 7x more breathing
-    // room. That gap is what makes the reference's ending sound like a deliberate landing rather than
-    // our ending, which ran right up to the edge and blurred into the next repeat's dense opening.
-    // The reference also has a tight little 4-tap "flourish" cluster (86%-89.5%) right before it
-    // stops, which the tail below now mirrors, rather than just truncating the old smooth curve early.
+    // FIX (requested - simplified per feedback): the previous tail invented a tight 6-point "flourish
+    // cluster" (0.760-0.892) meant to mirror what automated peak-detection found in the reference
+    // audio - but that detection likely picked up resonance/ringing as if they were separate onsets,
+    // which a human ear correctly ignores. The actual, simpler complaint was just about the LAST
+    // THREE hits not landing well. This tail now does one thing: continues the SAME smooth,
+    // ever-increasing-gap curve the rest of the pattern already follows, for three more points, and
+    // stops with clear trailing space (86% of the measure) - no invented cluster, no special-casing.
     float p0[]={0.000f,0.007f,0.015f,0.024f,0.034f,0.047f,0.061f,0.078f,0.098f,0.121f,0.147f,0.178f,
                 0.214f,0.256f,0.305f,0.362f,0.429f,0.506f,0.596f,0.701f,
-                0.760f,0.815f,0.855f,0.870f,0.882f,0.892f};
+                0.760f,0.815f,0.860f};
     pat.count=(int)(sizeof(p0)/sizeof(p0[0]));
     for(int i=0;i<pat.count;++i) pat.positions[i]=p0[i];
     return pat;
 }
+// FIX (requested - Preset 2, "Reverse"): the exact mirror image of Forward, reflected around the
+// centre of the measure AND reversed in order (reversed[i] = 1 - forward[N-1-i]). Forward is dense at
+// the start and rests before the end; Reverse rests at the start and builds to maximum density right
+// into the next downbeat - a classic riser/build shape. Computed FROM Forward rather than hand-tuned
+// separately, so any future adjustment to Forward's tail automatically keeps Reverse's opening
+// consistent with it, instead of the two silently drifting apart over time.
+static PDAudioProcessor::Pattern buildReversePattern(){
+    const auto& fwd=buildForwardPattern();
+    PDAudioProcessor::Pattern pat{};
+    pat.count=fwd.count;
+    for(int i=0;i<fwd.count;++i){
+        float mirrored=1.0f-fwd.positions[fwd.count-1-i];
+        // Safety margin identical in spirit to Forward's own - never land exactly ON the next
+        // measure's first tap (fraction 0.0), which would double-trigger at the same instant.
+        pat.positions[i]=juce::jmin(mirrored,0.985f);
+    }
+    return pat;
+}
 const PDAudioProcessor::Pattern& PDAudioProcessor::getPattern(int index){
-    // FIX (real bug found in review): the old version guarded lazy-building this table with a hand-
-    // rolled `static bool built` flag and no lock at all - if two threads ever called this for the
-    // first time at once, both could see built==false simultaneously and race to write the same
-    // memory, which is undefined behaviour even though they'd have written identical values. A
-    // static local variable initialized directly from a function call, like this one, is
-    // "magic statics" - the C++11 standard itself guarantees the initializer runs exactly once, with
-    // proper synchronization, no matter how many threads call this concurrently. No manual flag
-    // needed, and it's actually safe rather than just unlikely to break.
-    static const Pattern theOnlyPattern = buildTheOnlyPattern();
-    juce::ignoreUnused(index); // all three slots return the same pattern for now, see comment above
-    return theOnlyPattern;
+    // FIX (real bug found in review, still applies): a static local with a real initializer
+    // expression is "magic statics" - the C++11 standard itself guarantees this runs exactly once,
+    // thread-safe, no matter how many threads call this concurrently. No manual flag/lock needed.
+    static const Pattern forward = buildForwardPattern();
+    static const Pattern reverse = buildReversePattern();
+    return (juce::jlimit(0,1,index)==0) ? forward : reverse;
 }
 
 // FIX (requested): the factory default must be a genuinely FLAT line - every point at gain 1.0, no
