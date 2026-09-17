@@ -1,11 +1,14 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
+#include <cstring>
 
 PDAudioProcessor::PDAudioProcessor()
     : AudioProcessor(BusesProperties().withInput("Input",juce::AudioChannelSet::stereo(),true)
                                        .withOutput("Output",juce::AudioChannelSet::stereo(),true)),
       apvts(*this,nullptr,"PD_PARAMS",createParameterLayout())
-{}
+{
+    for(int i=0;i<3;++i) volumeCurves[i]=defaultVolumeCurve(i);
+}
 
 PDAudioProcessor::~PDAudioProcessor(){}
 
@@ -36,9 +39,11 @@ void PDAudioProcessor::prepareToPlay(double sampleRate,int){
     samplePosition=0;
 }
 
-// FIX (redesign): positions are a fraction of ONE MEASURE (0..1), extracted directly from the
-// reference audio at exactly one measure @ 75 BPM (27 taps, dense at the start, spreading out
-// towards the end of the bar) - dividing the earlier per-beat numbers by 4 (4 beats/measure).
+// FIX (redesign): positions are a fraction of ONE MEASURE (0..1). Pattern 1 was extracted directly
+// from the reference audio at exactly one measure @ 75 BPM. Pattern 2 is a mathematically-smooth
+// alternative (a clean exponential deceleration curve) built specifically to compare against Pattern
+// 1 by ear - one of these two will become the real Pattern 1 once picked, per the plan to keep
+// whichever "feels" right and build the rest of the pattern set from it.
 const PDAudioProcessor::Pattern& PDAudioProcessor::getPattern(int index){
     static Pattern patterns[3];
     static bool built=false;
@@ -49,10 +54,15 @@ const PDAudioProcessor::Pattern& PDAudioProcessor::getPattern(int index){
                     0.822f,0.892f,0.970f};
         patterns[0].count=(int)(sizeof(p0)/sizeof(p0[0]));
         for(int i=0;i<patterns[0].count;++i) patterns[0].positions[i]=p0[i];
-        // Patterns 2 & 3 (reverse / slower 2-measure variants) are planned but not built yet - empty
-        // pattern = no taps added (dry-only), rather than silently reusing Pattern 1 and pretending
-        // to be a different option.
-        patterns[1].count=0; patterns[2].count=0;
+        // Pattern 2: exp(k*i/(N-1)) shape, k=3.2 - gaps grow monotonically from ~0.007 to ~0.14 of a
+        // measure, scaled to stay clear of the next-measure boundary (max 0.965, not 1.0).
+        float p1[]={0.000f,0.007f,0.015f,0.024f,0.034f,0.047f,0.061f,0.078f,0.098f,0.121f,0.147f,0.178f,
+                    0.214f,0.256f,0.305f,0.362f,0.429f,0.506f,0.596f,0.701f,0.823f,0.965f};
+        patterns[1].count=(int)(sizeof(p1)/sizeof(p1[0]));
+        for(int i=0;i<patterns[1].count;++i) patterns[1].positions[i]=p1[i];
+        // Pattern 3 (planned, not built yet) - empty = no taps added (dry-only), rather than silently
+        // reusing Pattern 1/2 and pretending to be a third option.
+        patterns[2].count=0;
     }
     index=juce::jlimit(0,2,index);
     return patterns[(size_t)index];
@@ -61,22 +71,19 @@ const PDAudioProcessor::Pattern& PDAudioProcessor::getPattern(int index){
 // FIX (requested): the volume-edit preset must start FLAT, not sloping immediately - an explicit
 // plateau from x=0 to the second point, THEN the dip/rise shape, so the first few (densest, closest-
 // to-the-attack) taps keep full volume rather than already fading before the "cloud" texture even
-// gets going.
-PDAudioProcessor::VolumeCurve& PDAudioProcessor::getVolumeCurve(int index){
-    static VolumeCurve curves[3];
-    static bool built=false;
-    if(!built){
-        built=true;
+// gets going. This is now only the FACTORY DEFAULT each curve resets to - see the header comment on
+// why the curves themselves had to stop being static/shared to make "resets to flat" reliable.
+PDAudioProcessor::VolumeCurve PDAudioProcessor::defaultVolumeCurve(int index){
+    VolumeCurve c;
+    if(index==0){
         VolumePoint c0[]={ {0.00f,1.00f}, {0.15f,1.00f}, {0.40f,0.55f}, {0.62f,0.50f}, {0.80f,0.82f}, {1.00f,0.95f} };
-        curves[0].count=(int)(sizeof(c0)/sizeof(c0[0]));
-        for(int i=0;i<curves[0].count;++i) curves[0].points[i]=c0[i];
-        // Curves 2 & 3 (other editable fade shapes) planned but not built yet - default to a flat
-        // line at unity gain (i.e. "no fade") rather than silently duplicating Curve 1.
-        curves[1].count=2; curves[1].points[0]={0.f,1.f}; curves[1].points[1]={1.f,1.f};
-        curves[2].count=2; curves[2].points[0]={0.f,1.f}; curves[2].points[1]={1.f,1.f};
+        c.count=6; for(int i=0;i<6;++i) c.points[i]=c0[i];
+    } else {
+        // Curves 2 & 3 (other editable fade shapes) planned but not built yet - flat line at unity
+        // gain (i.e. "no fade") rather than silently duplicating Curve 1.
+        c.count=2; c.points[0]={0.f,1.f}; c.points[1]={1.f,1.f};
     }
-    index=juce::jlimit(0,2,index);
-    return curves[(size_t)index];
+    return c;
 }
 
 float PDAudioProcessor::evalVolumeCurve(const VolumeCurve& c,float x){
@@ -101,14 +108,28 @@ void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
     int patternIdx=(int)apvts.getRawParameterValue(pPattern)->load();
     int curveIdx=(int)apvts.getRawParameterValue(pVolumeCurve)->load();
     const auto& pat=getPattern(patternIdx);
-    const auto& curve=getVolumeCurve(curveIdx);
+    const auto& curve=volumeCurves[juce::jlimit(0,2,curveIdx)];
     double bpm=uiBpm.load(); int num=uiTimeSigNumerator.load();
     double measureSec = (60.0/juce::jmax(1.0,bpm)) * juce::jmax(1,num);
     juce::int64 measureSamples=(juce::int64)std::round(measureSec*sr);
     for(int i=0;i<pat.count;++i){
         juce::int64 off=(juce::int64)std::round((double)pat.positions[i]*(double)measureSamples);
         float gain=evalVolumeCurve(curve,pat.positions[i]);
-        pendingTaps.push_back({triggerSample+off,gain,triggerSample});
+        pendingTaps.push_back({triggerSample+off,gain,triggerSample,0});
+    }
+    // FIX (requested - "most important problem"): each tap's playback is now also capped by the gap
+    // to the NEXT scheduled tap, not just by the Grain Length parameter. Without this, closely-spaced
+    // early taps (as little as 15-20ms apart) each played up to the full ~90ms grain length, so 4-5
+    // consecutive taps' playback heavily overlapped and blurred into one smeared burst instead of a
+    // clean, distinct repeat texture. Capped here, at schedule time, since it depends on knowing
+    // where the *next* tap sits, which isn't available yet when a tap is first activated.
+    for(size_t i=0;i<pendingTaps.size();++i){
+        if(i+1<pendingTaps.size()){
+            juce::int64 gap=pendingTaps[i+1].startSample-pendingTaps[i].startSample;
+            pendingTaps[i].maxLenSamples=juce::jmax((juce::int64)1,gap);
+        } else {
+            pendingTaps[i].maxLenSamples=1LL<<40; // last tap in the pattern - no next tap to worry about
+        }
     }
     grainWritePos=0; grainArmed=true; grainBuffer.clear();
 }
@@ -164,7 +185,8 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                 // it naturally produces shorter, tighter early repeats and fuller later ones, which
                 // is exactly the texture the reference audio has.
                 int availableSoFar=(int)(absSample-pendingTaps[t].triggerSample);
-                int len=juce::jlimit(0,desiredGrainSamples,availableSoFar);
+                juce::int64 cap64=juce::jmin((juce::int64)desiredGrainSamples,pendingTaps[t].maxLenSamples);
+                int len=juce::jlimit(0,(int)cap64,availableSoFar);
                 if(len>0) activeTaps.push_back({0,len,len,pendingTaps[t].gain});
                 pendingTaps.erase(pendingTaps.begin()+(long)t);
             } else ++t;
@@ -204,13 +226,37 @@ juce::AudioProcessorEditor* PDAudioProcessor::createEditor(){ return new PDAudio
 
 void PDAudioProcessor::getStateInformation(juce::MemoryBlock& destData){
     auto state=apvts.copyState();
+    juce::MemoryBlock curvesBlock;
+    for(int c=0;c<3;++c){
+        curvesBlock.append(&volumeCurves[c].count,sizeof(int));
+        curvesBlock.append(volumeCurves[c].points,sizeof(VolumePoint)*kMaxVolumePoints);
+    }
+    state.setProperty("volumeCurvesData",curvesBlock.toBase64Encoding(),nullptr);
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
     copyXmlToBinary(*xml,destData);
 }
 void PDAudioProcessor::setStateInformation(const void* data,int sizeInBytes){
     std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data,sizeInBytes));
-    if(xml && xml->hasTagName(apvts.state.getType()))
-        apvts.replaceState(juce::ValueTree::fromXml(*xml));
+    if(!xml || !xml->hasTagName(apvts.state.getType())) return;
+    auto tree=juce::ValueTree::fromXml(*xml);
+    apvts.replaceState(tree);
+    const size_t perCurve=sizeof(int)+sizeof(VolumePoint)*kMaxVolumePoints;
+    juce::MemoryBlock mb;
+    bool ok = tree.hasProperty("volumeCurvesData")
+        && mb.fromBase64Encoding(tree["volumeCurvesData"].toString())
+        && mb.getSize()>=perCurve*3;
+    for(int c=0;c<3;++c){
+        if(ok){
+            size_t pos=c*perCurve;
+            int count=0; std::memcpy(&count,(const char*)mb.getData()+pos,sizeof(int));
+            volumeCurves[c].count=juce::jlimit(0,kMaxVolumePoints,count);
+            std::memcpy(volumeCurves[c].points,(const char*)mb.getData()+pos+sizeof(int),sizeof(VolumePoint)*kMaxVolumePoints);
+        } else {
+            // Older save with no curve data, or a corrupt block - fall back to the flat factory
+            // default rather than leaving whatever was in memory before this call.
+            volumeCurves[c]=defaultVolumeCurve(c);
+        }
+    }
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){ return new PDAudioProcessor(); }
