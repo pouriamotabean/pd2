@@ -1,17 +1,17 @@
 #pragma once
 #include <JuceHeader.h>
-#include <atomic>
-#include <array>
 
-// PD - Decelerating Modulator
-// Core DSP behavior is intentionally preserved from v0.1:
-// transient -> fast modulation -> smooth rate deceleration -> retrigger.
-// v0.2 adds a proper APVTS parameter layer for DAW automation/state recall and
-// makes the detector/effect stages more robust without changing the exposed ranges.
+// PD - "Repeat Pattern" - complete redesign per the reference-audio analysis session:
+// the effect is NOT a continuously-decelerating LFO. It's a fixed rhythmic TAP PATTERN (positions
+// expressed as a fraction of one measure, so it scales to any tempo) where each tap replays a short
+// captured grain of the input's own attack, at a volume taken from an editable VOLUME CURVE (also
+// one measure long). The original input is never touched - it passes through 100% dry, untouched,
+// exactly as recorded, so the attack/punch of the source note is never altered. The taps are added
+// ON TOP of that dry signal, not instead of it.
 class PDAudioProcessor : public juce::AudioProcessor {
 public:
     PDAudioProcessor();
-    ~PDAudioProcessor() override = default;
+    ~PDAudioProcessor() override;
 
     void prepareToPlay(double sampleRate, int samplesPerBlock) override;
     void releaseResources() override {}
@@ -25,7 +25,7 @@ public:
     bool acceptsMidi() const override { return false; }
     bool producesMidi() const override { return false; }
     bool isMidiEffect() const override { return false; }
-    double getTailLengthSeconds() const override { return 0.0; }
+    double getTailLengthSeconds() const override { return 2.0; }
 
     int getNumPrograms() override { return 1; }
     int getCurrentProgram() override { return 0; }
@@ -36,62 +36,66 @@ public:
     void getStateInformation(juce::MemoryBlock&) override;
     void setStateInformation(const void*, int) override;
 
-    enum class DecelCurve { Exponential, Linear, Logarithmic };
-    enum class Target { Amplitude, Filter, Pitch };
-    enum class Shape { Sine, Triangle, Square, Saw };
-
-    static constexpr int kNumDivisions = 7;
-    static constexpr const char* kDivisionNames[kNumDivisions] = {"1/32","1/16","1/8","1/4","1/2","1/1","2/1"};
-    static constexpr float kDivisionBeats[kNumDivisions] = {0.125f,0.25f,0.5f,1.f,2.f,4.f,8.f};
-
-    // Public mirrors retained for compatibility with the original UI/source.
-    std::atomic<bool> bypassed{false};
-    std::atomic<bool> bpmSync{true};
-    std::atomic<int> startDivIndex{1};
-    std::atomic<int> endDivIndex{3};
-    std::atomic<float> startRateHz{8.f};
-    std::atomic<float> endRateHz{2.f};
-    std::atomic<float> decelTimeSec{2.0f};
-    std::atomic<DecelCurve> decelCurve{DecelCurve::Exponential};
-    std::atomic<float> depth{0.7f};
-    std::atomic<Target> target{Target::Amplitude};
-    std::atomic<Shape> shape{Shape::Sine};
-
-    std::atomic<float> uiCurrentRateHz{0.f};
-    std::atomic<float> uiElapsedSinceTrigger{999.f};
-    std::atomic<bool> uiJustTriggered{false};
-    std::atomic<float> uiInputLevelDb{-100.f};
-    std::atomic<int> uiTriggerCount{0};
-    double currentBpm = 120.0;
-
+    // ---- Parameters (APVTS - Bypass is host-automatable; pattern/volume-curve choice are simple
+    // discrete selections, also parameters so a saved project remembers the choice) ----
     juce::AudioProcessorValueTreeState apvts;
-
     static juce::AudioProcessorValueTreeState::ParameterLayout createParameterLayout();
-    static float shapeCurve(float t, DecelCurve c);
-    static float lfoWave(float phase01, Shape s);
+    static constexpr const char* pBypass = "bypass";
+    static constexpr const char* pPattern = "pattern";
+    static constexpr const char* pVolumeCurve = "volumeCurve";
+    static constexpr const char* pGrainMs = "grainMs";
+
+    // ---- UI-readable live state (written by the audio thread, read by the editor's timer) ----
+    std::atomic<float> uiElapsedSinceTrigger{999.f};
+    std::atomic<int> uiTriggerCount{0};
+    std::atomic<double> uiBpm{120.0};
+    std::atomic<int> uiTimeSigNumerator{4};
+
+    // ---- Pattern data: onset positions as a FRACTION OF ONE MEASURE (0..1) - tempo AND time-
+    // signature independent by construction, since "one measure" is whatever the host says it is.
+    static constexpr int kMaxPatternPoints = 40;
+    struct Pattern { int count=0; float positions[kMaxPatternPoints]{}; };
+    static const Pattern& getPattern(int index); // index 0 = the only populated one for now
+
+    // ---- Volume curve: a handful of (x = fraction of measure, y = gain multiplier) control points,
+    // smoothly interpolated (smootherstep between segments) - drag-editable in the UI (y only, for
+    // now; x positions are fixed anchors, matching "3 preset shapes" rather than free-form points).
+    struct VolumePoint { float x, y; };
+    static constexpr int kMaxVolumePoints = 6;
+    struct VolumeCurve { int count=0; VolumePoint points[kMaxVolumePoints]{}; };
+    static VolumeCurve& getVolumeCurve(int index); // mutable - the UI edits this directly (y values)
+    static float evalVolumeCurve(const VolumeCurve&, float x);
 
 private:
     double sr = 44100.0;
 
-    // More stable onset detector: fast/slow followers + adaptive floor + hysteresis.
-    float envFast = 0.f, envSlow = 0.f;
-    float detectorFloor = 0.f;
-    bool detectorArmed = true;
-    double timeSinceLastTrigger = 0.0;
-    static constexpr double kMinRetriggerGapSec = 0.05;
+    // Onset (transient) detector - same fast/slow envelope-follower trigger used in the original PD.
+    float envFast=0.f, envSlow=0.f;
+    juce::int64 samplesSinceLastTrigger = 1LL<<40;
 
-    double phase = 0.0;
-    double elapsed = 999.0;
+    // Grain capture: records the input starting the instant a trigger fires, so taps have real,
+    // untouched source audio to replay - never a synthesized tone. One mono-summed detector envelope
+    // decides WHEN to trigger; the grain itself is captured in full stereo.
+    // FIX (found while reviewing before delivery): a fixed 96000-sample cap was smaller than ONE
+    // MEASURE at 75 BPM already (3.2s = 141,120 samples at 44.1kHz) - late taps in the pattern would
+    // have silently gone quiet once capture hit that ceiling. Sized in prepareToPlay() instead, from
+    // the real sample rate, generously (8 seconds - comfortably covers a full measure even at very
+    // slow tempos, e.g. 4/4 at 60 BPM is still only 4s).
+    int grainBufferCapacitySamples = 96000; // placeholder; recomputed in prepareToPlay()
+    juce::AudioBuffer<float> grainBuffer; // 2 x grainBufferCapacitySamples, re-armed fresh per trigger
+    int grainWritePos = 0;
+    bool grainArmed = false;
 
-    float filterStateL = 0.f, filterStateR = 0.f;
-    float filterCoeff = 0.f;
+    struct PendingTap { juce::int64 startSample; float gain; juce::int64 triggerSample; };
+    struct ActiveTap { int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f; };
+    std::vector<PendingTap> pendingTaps;
+    std::vector<ActiveTap> activeTaps;
+    juce::int64 samplePosition = 0; // running absolute sample counter, never reset
 
-    static constexpr int kPitchDelayBufSize = 4096;
-    std::array<float,kPitchDelayBufSize> pitchDelayL{}, pitchDelayR{};
-    int pitchWriteIdx = 0;
+    int grainLengthSamplesFor(float desiredMs) const { return (int)std::round(desiredMs*0.001*sr); }
+    static constexpr int kFadeSamples = 48; // short raised-cosine in/out on every tap to avoid clicks
 
-    void syncAtomicsFromParameters();
-    float currentRateFor(double elapsedSec) const;
+    void scheduleTapsForTrigger(juce::int64 triggerSample);
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR(PDAudioProcessor)
 };
