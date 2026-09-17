@@ -9,26 +9,22 @@ jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Configure
-        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -G "Visual Studio 17 2022" -A x64
 
       - name: Build
         run: cmake --build build --config Release -- /clp:ErrorsOnly
 
-      - name: Collect the .vst3
+      - name: Locate VST3
         shell: pwsh
         run: |
-          $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" -Directory | Select-Object -First 1
-          if (-not $vst) { $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" | Select-Object -First 1 }
-          if (-not $vst) { throw "No .vst3 artifact found after build." }
-          New-Item -ItemType Directory -Force -Path artifact | Out-Null
-          Copy-Item -Recurse -Force $vst.FullName artifact/
+          $vst3 = Get-ChildItem -Recurse -Path build -Filter "*.vst3" -Directory | Select-Object -First 1
+          if (-not $vst3) { throw "No .vst3 found" }
+          echo "VST3_PATH=$($vst3.FullName)" >> $env:GITHUB_ENV
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: PD-VST3
-          path: artifact
+          path: ${{ env.VST3_PATH }}
