@@ -18,7 +18,7 @@ private:
     PDAudioProcessor& p;
     void timerCallback() override;
 
-    juce::Rectangle<float> patternArea, volumeArea, volumePlotArea, patternLabelHitBox;
+    juce::Rectangle<float> patternArea, volumeArea, volumePlotArea;
     int draggedPointIndex=-1;
 
     // Only the Y of each volume-curve control point is drag-editable for now (X positions are fixed
