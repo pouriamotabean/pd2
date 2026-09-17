@@ -16,13 +16,14 @@ jobs:
         run: cmake -B build -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
-        run: cmake --build build --config Release -- /clp:ErrorsOnly;Summary
+        run: cmake --build build --config Release -- /clp:ErrorsOnly
 
       - name: Collect the .vst3
         shell: pwsh
         run: |
           $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" -Directory | Select-Object -First 1
           if (-not $vst) { $vst = Get-ChildItem -Path build -Recurse -Filter "*.vst3" | Select-Object -First 1 }
+          if (-not $vst) { throw "No .vst3 artifact found after build." }
           New-Item -ItemType Directory -Force -Path artifact | Out-Null
           Copy-Item -Recurse -Force $vst.FullName artifact/
 
