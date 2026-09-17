@@ -46,7 +46,7 @@ juce::Point<float> PDAudioProcessorEditor::volumePointToScreen(const PDAudioProc
 }
 int PDAudioProcessorEditor::hitTestVolumePoint(juce::Point<float> pos) const {
     int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    const auto& c=PDAudioProcessor::getVolumeCurve(idx);
+    const auto& c=p.volumeCurves[juce::jlimit(0,2,idx)];
     for(int i=0;i<c.count;++i){
         auto sp=volumePointToScreen(c,i);
         if(sp.getDistanceFrom(pos)<12.f) return i;
@@ -59,12 +59,33 @@ void PDAudioProcessorEditor::mouseDown(const juce::MouseEvent& e){
 void PDAudioProcessorEditor::mouseDrag(const juce::MouseEvent& e){
     if(draggedPointIndex<0) return;
     int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    auto& c=PDAudioProcessor::getVolumeCurve(idx);
+    auto& c=p.volumeCurves[juce::jlimit(0,2,idx)];
     float norm=juce::jlimit(0.f,1.f,(volumePlotArea.getBottom()-e.position.y)/volumePlotArea.getHeight());
     c.points[draggedPointIndex].y=juce::jlimit(0.f,1.3f,norm*1.3f);
     repaint();
 }
 void PDAudioProcessorEditor::mouseUp(const juce::MouseEvent&){ draggedPointIndex=-1; }
+void PDAudioProcessorEditor::mouseDoubleClick(const juce::MouseEvent& e){
+    // FIX (requested): double-clicking a volume-curve node resets JUST that node back to flat
+    // (gain 1.0) - a quick way to undo one point's edit without resetting the whole curve.
+    int hit=hitTestVolumePoint(e.position);
+    if(hit>=0){
+        int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
+        p.volumeCurves[juce::jlimit(0,2,idx)].points[hit].y=1.0f;
+        repaint();
+        return;
+    }
+    // Temporary A/B-testing control (until the real preset panel is wired in): double-click the
+    // pattern label in the schematic header to cycle between the built patterns.
+    if(patternLabelHitBox.contains(e.position)){
+        if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPattern)){
+            int cur=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPattern)->load();
+            int next=(cur+1)%3;
+            a->setValueNotifyingHost((float)next/2.f);
+        }
+        repaint();
+    }
+}
 
 void PDAudioProcessorEditor::paint(juce::Graphics& g){
     g.fillAll(bg());
@@ -89,8 +110,13 @@ void PDAudioProcessorEditor::paint(juce::Graphics& g){
     // ---- Pattern schematic ----
     g.setColour(panel()); g.fillRoundedRectangle(patternArea,12.f);
     g.setColour(border()); g.drawRoundedRectangle(patternArea,12.f,1.f);
+    int patIdxForLabel=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPattern)->load();
+    juce::String patLabel="PATTERN "+juce::String(patIdxForLabel+1);
+    patternLabelHitBox={patternArea.getX()+16.f,patternArea.getY()+10.f,120.f,16.f};
     g.setColour(muted()); g.setFont(juce::FontOptions(11.f).withStyle("bold"));
-    g.drawText("PATTERN 1",patternArea.getX()+16.f,patternArea.getY()+10.f,200.f,16.f,juce::Justification::left);
+    g.drawText(patLabel,patternLabelHitBox,juce::Justification::left);
+    g.setColour(muted().withAlpha(0.6f)); g.setFont(juce::FontOptions(9.5f));
+    g.drawText("(double-click to A/B compare)",patternArea.getX()+120.f,patternArea.getY()+11.f,220.f,14.f,juce::Justification::left);
 
     int patIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPattern)->load();
     const auto& pat=PDAudioProcessor::getPattern(patIdx);
@@ -117,7 +143,7 @@ void PDAudioProcessorEditor::paint(juce::Graphics& g){
     g.drawText("drag the dots to reshape",volumeArea.getRight()-170.f,volumeArea.getY()+12.f,158.f,14.f,juce::Justification::right);
 
     int curveIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    auto& curve=PDAudioProcessor::getVolumeCurve(curveIdx);
+    auto& curve=p.volumeCurves[juce::jlimit(0,2,curveIdx)];
     // faint reference gridlines at gain 0.5 and 1.0
     g.setColour(juce::Colour(0xff232d38));
     for(float gval:{0.5f,1.0f}){
