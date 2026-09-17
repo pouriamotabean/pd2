@@ -39,13 +39,17 @@ PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProc
     endHzSlider.onValueChange=[this]{setParam("endHz",(float)((endHzSlider.getValue()-.5)/19.5));endValue.setText(juce::String(endHzSlider.getValue(),2)+" Hz",juce::dontSendNotification);};
     decelTimeSlider.onValueChange=[this]{setParam("decel",(float)((decelTimeSlider.getValue()-.1)/9.9));decelValue.setText(juce::String(decelTimeSlider.getValue(),2)+" s",juce::dontSendNotification);};
     depthSlider.onValueChange=[this]{setParam("depth",(float)depthSlider.getValue()/100.f);depthValue.setText(juce::String((int)depthSlider.getValue())+" %",juce::dontSendNotification);};
-    for(auto* l:{&startValue,&endValue,&decelValue,&depthValue,&triggerValue,&inputValue}){valueLabel(*l);addAndMakeVisible(*l);}
+    juce::Label* labels[] = { &startValue, &endValue, &decelValue, &depthValue, &triggerValue, &inputValue };
+    for (auto* l : labels) { valueLabel(*l); addAndMakeVisible(*l); }
 
-    for(auto* b:{&expBtn,&linBtn,&logBtn})addAndMakeVisible(*b);
+    PDToggleButton* curveButtons[] = { &expBtn, &linBtn, &logBtn };
+    for (auto* b : curveButtons) addAndMakeVisible(*b);
     expBtn.onClick=[this]{setParam("curve",0.f);refreshCurveButtons();};linBtn.onClick=[this]{setParam("curve",.5f);refreshCurveButtons();};logBtn.onClick=[this]{setParam("curve",1.f);refreshCurveButtons();};
-    for(auto* b:{&ampBtn,&filterBtn,&pitchBtn})addAndMakeVisible(*b);
+    PDToggleButton* targetButtons[] = { &ampBtn, &filterBtn, &pitchBtn };
+    for (auto* b : targetButtons) addAndMakeVisible(*b);
     ampBtn.onClick=[this]{setParam("target",0.f);refreshTargetButtons();};filterBtn.onClick=[this]{setParam("target",.5f);refreshTargetButtons();};pitchBtn.onClick=[this]{setParam("target",1.f);refreshTargetButtons();};
-    for(auto* b:{&sineBtn,&triBtn,&sqBtn,&sawBtn})addAndMakeVisible(*b);
+    PDToggleButton* shapeButtons[] = { &sineBtn, &triBtn, &sqBtn, &sawBtn };
+    for (auto* b : shapeButtons) addAndMakeVisible(*b);
     sineBtn.onClick=[this]{setParam("shape",0.f);refreshShapeButtons();};triBtn.onClick=[this]{setParam("shape",1.f/3.f);refreshShapeButtons();};sqBtn.onClick=[this]{setParam("shape",2.f/3.f);refreshShapeButtons();};sawBtn.onClick=[this]{setParam("shape",1.f);refreshShapeButtons();};
 
     triggerValue.setJustificationType(juce::Justification::centredLeft); inputValue.setJustificationType(juce::Justification::centredRight);
