@@ -1,251 +1,216 @@
 #include "PluginProcessor.h"
 #include "PluginEditor.h"
 
-namespace {
-constexpr auto pBypass = "bypass";
-constexpr auto pSync = "sync";
-constexpr auto pStartDiv = "startDiv";
-constexpr auto pEndDiv = "endDiv";
-constexpr auto pStartHz = "startHz";
-constexpr auto pEndHz = "endHz";
-constexpr auto pDecel = "decel";
-constexpr auto pCurve = "curve";
-constexpr auto pDepth = "depth";
-constexpr auto pTarget = "target";
-constexpr auto pShape = "shape";
-}
+PDAudioProcessor::PDAudioProcessor()
+    : AudioProcessor(BusesProperties().withInput("Input",juce::AudioChannelSet::stereo(),true)
+                                       .withOutput("Output",juce::AudioChannelSet::stereo(),true)),
+      apvts(*this,nullptr,"PD_PARAMS",createParameterLayout())
+{}
 
-juce::AudioProcessorValueTreeState::ParameterLayout PDAudioProcessor::createParameterLayout() {
+PDAudioProcessor::~PDAudioProcessor(){}
+
+juce::AudioProcessorValueTreeState::ParameterLayout PDAudioProcessor::createParameterLayout(){
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
-    ps.push_back(std::make_unique<juce::AudioParameterBool>(pBypass, "Bypass", false));
-    ps.push_back(std::make_unique<juce::AudioParameterBool>(pSync, "Tempo Sync", true));
-
-    juce::StringArray divs;
-    for (auto* n : kDivisionNames) divs.add(n);
-    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pStartDiv, "Start Division", divs, 1));
-    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pEndDiv, "End Division", divs, 3));
-    ps.push_back(std::make_unique<juce::AudioParameterFloat>(pStartHz, "Start Rate", juce::NormalisableRange<float>(0.5f,20.f,0.01f), 8.f, "Hz"));
-    ps.push_back(std::make_unique<juce::AudioParameterFloat>(pEndHz, "End Rate", juce::NormalisableRange<float>(0.5f,20.f,0.01f), 2.f, "Hz"));
-    ps.push_back(std::make_unique<juce::AudioParameterFloat>(pDecel, "Deceleration", juce::NormalisableRange<float>(0.1f,10.f,0.01f), 2.f, "s"));
-    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pCurve, "Curve", juce::StringArray{"EXP","LIN","LOG"}, 0));
-    ps.push_back(std::make_unique<juce::AudioParameterFloat>(pDepth, "Depth", juce::NormalisableRange<float>(0.f,1.f,0.001f), 0.7f));
-    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pTarget, "Target", juce::StringArray{"AMPLITUDE","FILTER","PITCH"}, 0));
-    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pShape, "Shape", juce::StringArray{"SINE","TRIANGLE","SQUARE","SAW"}, 0));
+    ps.push_back(std::make_unique<juce::AudioParameterBool>(pBypass,"Bypass",false));
+    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pPattern,"Pattern",
+        juce::StringArray{"Pattern 1","Pattern 2","Pattern 3"},0));
+    ps.push_back(std::make_unique<juce::AudioParameterChoice>(pVolumeCurve,"Volume Curve",
+        juce::StringArray{"Curve 1","Curve 2","Curve 3"},0));
+    ps.push_back(std::make_unique<juce::AudioParameterFloat>(pGrainMs,"Grain Length",
+        juce::NormalisableRange<float>(20.f,300.f,1.f),90.f));
     return { ps.begin(), ps.end() };
 }
 
-PDAudioProcessor::PDAudioProcessor()
-    : AudioProcessor(BusesProperties()
-        .withInput("Input", juce::AudioChannelSet::stereo(), true)
-        .withOutput("Output", juce::AudioChannelSet::stereo(), true)),
-      apvts(*this, nullptr, "PD_PARAMS", createParameterLayout())
-{
-    syncAtomicsFromParameters();
-}
-
 bool PDAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const {
-    return layouts.getMainOutputChannelSet() == juce::AudioChannelSet::stereo()
-        && layouts.getMainInputChannelSet() == juce::AudioChannelSet::stereo();
+    return layouts.getMainInputChannelSet()==juce::AudioChannelSet::stereo()
+        && layouts.getMainOutputChannelSet()==juce::AudioChannelSet::stereo();
 }
 
-void PDAudioProcessor::prepareToPlay(double sampleRate, int) {
-    sr = sampleRate;
-    envFast = envSlow = detectorFloor = 0.f;
-    detectorArmed = true;
-    timeSinceLastTrigger = 1.0;
-    phase = 0.0;
-    elapsed = 999.0;
-    filterStateL = filterStateR = 0.f;
-    filterCoeff = 0.f;
-    pitchDelayL.fill(0.f);
-    pitchDelayR.fill(0.f);
-    pitchWriteIdx = 0;
-    uiCurrentRateHz.store(currentRateFor(elapsed));
-    uiElapsedSinceTrigger.store((float)elapsed);
-    uiInputLevelDb.store(-100.f);
-    uiTriggerCount.store(0);
+void PDAudioProcessor::prepareToPlay(double sampleRate,int){
+    sr=sampleRate;
+    envFast=0.f; envSlow=0.f; samplesSinceLastTrigger=1LL<<40;
+    grainBufferCapacitySamples=(int)std::round(sr*8.0); // 8s - generous headroom over any realistic measure length
+    grainBuffer.setSize(2,grainBufferCapacitySamples); grainBuffer.clear();
+    grainWritePos=0; grainArmed=false;
+    pendingTaps.clear(); activeTaps.clear();
+    samplePosition=0;
 }
 
-float PDAudioProcessor::shapeCurve(float t, DecelCurve c) {
-    t = juce::jlimit(0.f,1.f,t);
-    switch (c) {
-        case DecelCurve::Exponential: {
-            constexpr float k = 5.f;
-            return (1.f-std::exp(-k*t))/(1.f-std::exp(-k));
+// FIX (redesign): positions are a fraction of ONE MEASURE (0..1), extracted directly from the
+// reference audio at exactly one measure @ 75 BPM (27 taps, dense at the start, spreading out
+// towards the end of the bar) - dividing the earlier per-beat numbers by 4 (4 beats/measure).
+const PDAudioProcessor::Pattern& PDAudioProcessor::getPattern(int index){
+    static Pattern patterns[3];
+    static bool built=false;
+    if(!built){
+        built=true;
+        float p0[]={0.020f,0.047f,0.062f,0.091f,0.108f,0.125f,0.143f,0.166f,0.187f,0.209f,0.231f,0.253f,
+                    0.279f,0.313f,0.337f,0.372f,0.405f,0.445f,0.485f,0.529f,0.589f,0.640f,0.697f,0.747f,
+                    0.822f,0.892f,0.970f};
+        patterns[0].count=(int)(sizeof(p0)/sizeof(p0[0]));
+        for(int i=0;i<patterns[0].count;++i) patterns[0].positions[i]=p0[i];
+        // Patterns 2 & 3 (reverse / slower 2-measure variants) are planned but not built yet - empty
+        // pattern = no taps added (dry-only), rather than silently reusing Pattern 1 and pretending
+        // to be a different option.
+        patterns[1].count=0; patterns[2].count=0;
+    }
+    index=juce::jlimit(0,2,index);
+    return patterns[(size_t)index];
+}
+
+// FIX (requested): the volume-edit preset must start FLAT, not sloping immediately - an explicit
+// plateau from x=0 to the second point, THEN the dip/rise shape, so the first few (densest, closest-
+// to-the-attack) taps keep full volume rather than already fading before the "cloud" texture even
+// gets going.
+PDAudioProcessor::VolumeCurve& PDAudioProcessor::getVolumeCurve(int index){
+    static VolumeCurve curves[3];
+    static bool built=false;
+    if(!built){
+        built=true;
+        VolumePoint c0[]={ {0.00f,1.00f}, {0.15f,1.00f}, {0.40f,0.55f}, {0.62f,0.50f}, {0.80f,0.82f}, {1.00f,0.95f} };
+        curves[0].count=(int)(sizeof(c0)/sizeof(c0[0]));
+        for(int i=0;i<curves[0].count;++i) curves[0].points[i]=c0[i];
+        // Curves 2 & 3 (other editable fade shapes) planned but not built yet - default to a flat
+        // line at unity gain (i.e. "no fade") rather than silently duplicating Curve 1.
+        curves[1].count=2; curves[1].points[0]={0.f,1.f}; curves[1].points[1]={1.f,1.f};
+        curves[2].count=2; curves[2].points[0]={0.f,1.f}; curves[2].points[1]={1.f,1.f};
+    }
+    index=juce::jlimit(0,2,index);
+    return curves[(size_t)index];
+}
+
+float PDAudioProcessor::evalVolumeCurve(const VolumeCurve& c,float x){
+    if(c.count<=0) return 1.f;
+    if(c.count==1) return c.points[0].y;
+    x=juce::jlimit(0.f,1.f,x);
+    if(x<=c.points[0].x) return c.points[0].y;
+    if(x>=c.points[c.count-1].x) return c.points[c.count-1].y;
+    for(int i=0;i<c.count-1;++i){
+        if(x>=c.points[i].x && x<=c.points[i+1].x){
+            float span=c.points[i+1].x-c.points[i].x;
+            float t = span>1e-6f ? (x-c.points[i].x)/span : 0.f;
+            float t2 = t*t*t*(t*(t*6.f-15.f)+10.f); // smootherstep - eases in/out of each segment
+            return c.points[i].y + (c.points[i+1].y-c.points[i].y)*t2;
         }
-        case DecelCurve::Logarithmic: return t*t;
-        case DecelCurve::Linear: default: return t;
     }
+    return c.points[c.count-1].y;
 }
 
-float PDAudioProcessor::lfoWave(float phase01, Shape s) {
-    switch (s) {
-        case Shape::Triangle: return 2.f*std::abs(2.f*(phase01-std::floor(phase01+0.5f)))-1.f;
-        case Shape::Square: return phase01 < 0.5f ? 1.f : -1.f;
-        case Shape::Saw: return 2.f*phase01-1.f;
-        case Shape::Sine: default: return std::sin(juce::MathConstants<float>::twoPi*phase01);
+void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
+    pendingTaps.clear(); activeTaps.clear(); // a fresh note re-arms the whole pattern from scratch
+    int patternIdx=(int)apvts.getRawParameterValue(pPattern)->load();
+    int curveIdx=(int)apvts.getRawParameterValue(pVolumeCurve)->load();
+    const auto& pat=getPattern(patternIdx);
+    const auto& curve=getVolumeCurve(curveIdx);
+    double bpm=uiBpm.load(); int num=uiTimeSigNumerator.load();
+    double measureSec = (60.0/juce::jmax(1.0,bpm)) * juce::jmax(1,num);
+    juce::int64 measureSamples=(juce::int64)std::round(measureSec*sr);
+    for(int i=0;i<pat.count;++i){
+        juce::int64 off=(juce::int64)std::round((double)pat.positions[i]*(double)measureSamples);
+        float gain=evalVolumeCurve(curve,pat.positions[i]);
+        pendingTaps.push_back({triggerSample+off,gain,triggerSample});
     }
+    grainWritePos=0; grainArmed=true; grainBuffer.clear();
 }
 
-void PDAudioProcessor::syncAtomicsFromParameters() {
-    bypassed.store(apvts.getRawParameterValue(pBypass)->load() > 0.5f);
-    bpmSync.store(apvts.getRawParameterValue(pSync)->load() > 0.5f);
-    startDivIndex.store((int)std::lround(apvts.getRawParameterValue(pStartDiv)->load()));
-    endDivIndex.store((int)std::lround(apvts.getRawParameterValue(pEndDiv)->load()));
-    startRateHz.store(apvts.getRawParameterValue(pStartHz)->load());
-    endRateHz.store(apvts.getRawParameterValue(pEndHz)->load());
-    decelTimeSec.store(apvts.getRawParameterValue(pDecel)->load());
-    decelCurve.store((DecelCurve)(int)std::lround(apvts.getRawParameterValue(pCurve)->load()));
-    depth.store(apvts.getRawParameterValue(pDepth)->load());
-    target.store((Target)(int)std::lround(apvts.getRawParameterValue(pTarget)->load()));
-    shape.store((Shape)(int)std::lround(apvts.getRawParameterValue(pShape)->load()));
-}
-
-float PDAudioProcessor::currentRateFor(double elapsedSec) const {
-    float startHz, endHz;
-    if (bpmSync.load()) {
-        int si = juce::jlimit(0,kNumDivisions-1,startDivIndex.load());
-        int ei = juce::jlimit(0,kNumDivisions-1,endDivIndex.load());
-        startHz = (float)(currentBpm/(60.0*kDivisionBeats[si]));
-        endHz = (float)(currentBpm/(60.0*kDivisionBeats[ei]));
-    } else {
-        startHz = startRateHz.load();
-        endHz = endRateHz.load();
-    }
-    float decelTime = juce::jmax(0.05f,decelTimeSec.load());
-    float shaped = shapeCurve((float)(elapsedSec/decelTime),decelCurve.load());
-    return startHz + (endHz-startHz)*shaped;
-}
-
-void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& buffer, juce::MidiBuffer&) {
+void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer&){
     juce::ScopedNoDenormals noDenormals;
-    const int numCh = buffer.getNumChannels(), numSamples = buffer.getNumSamples();
-    if (numCh < 2) return;
+    const int n=b.getNumSamples(); const int ch=juce::jmin(2,b.getNumChannels());
+    if(ch<2){ samplePosition+=n; return; } // mono-in not supported by this effect's stereo grain design
 
-    if (auto* ph = getPlayHead())
-        if (auto pos = ph->getPosition(); pos.hasValue())
-            if (auto bpmOpt = pos->getBpm(); bpmOpt.hasValue())
-                currentBpm = juce::jmax(20.0,*bpmOpt);
-
-    // APVTS is the automation/state authority; atomics remain the DSP-facing cache.
-    syncAtomicsFromParameters();
-    if (bypassed.load()) {
-        uiCurrentRateHz.store(currentRateFor(elapsed));
-        uiElapsedSinceTrigger.store((float)elapsed);
-        return;
+    // Tempo/time-signature from host, once per block - a plain default (120 BPM, 4/4) if the host
+    // doesn't report a tempo (e.g. a bare test host), so the plugin never divides by zero/garbage.
+    if(auto* ph=getPlayHead()){
+        if(auto pos=ph->getPosition()){
+            if(auto bpmOpt=pos->getBpm()) uiBpm.store(*bpmOpt>1.0?*bpmOpt:120.0);
+            if(auto tsOpt=pos->getTimeSignature()) uiTimeSigNumerator.store(juce::jmax(1,tsOpt->numerator));
+        }
     }
 
-    auto* L = buffer.getWritePointer(0);
-    auto* R = buffer.getWritePointer(1);
-    const Target tgt = target.load();
-    const Shape shp = shape.load();
-    const float dep = juce::jlimit(0.f,1.f,depth.load());
+    const bool byp=apvts.getRawParameterValue(pBypass)->load()>0.5f;
+    const float grainMs=apvts.getRawParameterValue(pGrainMs)->load();
+    const int desiredGrainSamples=grainLengthSamplesFor(grainMs);
 
-    float blockPeak = 0.f;
-    for (int i=0;i<numSamples;++i) {
-        const float in = 0.5f*(L[i]+R[i]);
-        blockPeak = juce::jmax(blockPeak,std::abs(in));
-        const float rectified = std::abs(in);
+    for(int i=0;i<n;++i){
+        float L=b.getSample(0,i), R=b.getSample(1,i);
+        float mono=0.5f*(L+R);
 
-        // Faster attack, controlled release. The adaptive floor prevents a sustained loud signal
-        // from repeatedly retriggering while a quiet transient can still be detected.
-        envFast += (rectified-envFast) * (rectified>envFast ? 0.45f : 0.035f);
-        envSlow += (rectified-envSlow) * 0.0015f;
-        detectorFloor += (envSlow-detectorFloor) * 0.0025f;
-        timeSinceLastTrigger += 1.0/sr;
-
-        const float threshold = juce::jmax(0.008f, detectorFloor*1.35f + 0.006f);
-        const bool above = envFast > juce::jmax(envSlow*2.0f + 0.006f, threshold);
-        const bool onset = detectorArmed && above && timeSinceLastTrigger > kMinRetriggerGapSec;
-        if (onset) {
-            elapsed = 0.0;
-            phase = 0.0;
-            timeSinceLastTrigger = 0.0;
-            detectorArmed = false;
-            uiJustTriggered.store(true);
+        // --- Onset (transient) detection - unchanged fast/slow envelope trigger from the original PD ---
+        float av=std::abs(mono);
+        envFast += (av>envFast? 0.6f:0.05f)*(av-envFast);
+        envSlow += (av>envSlow? 0.002f:0.002f)*(av-envSlow);
+        ++samplesSinceLastTrigger;
+        bool trigger = !byp && envFast>envSlow*2.2f+0.01f && samplesSinceLastTrigger>(int)(0.05*sr);
+        if(trigger){
+            samplesSinceLastTrigger=0;
+            uiElapsedSinceTrigger.store(0.f);
             uiTriggerCount.fetch_add(1);
-        } else if (!above && envFast < envSlow*1.25f + 0.004f) {
-            detectorArmed = true;
-        } else if (elapsed < 1000.0) {
-            elapsed += 1.0/sr;
+            scheduleTapsForTrigger(samplePosition+i);
         }
 
-        const float rateHz = currentRateFor(elapsed);
-        phase += rateHz/sr;
-        if (phase >= 1.0) phase -= std::floor(phase);
-        const float lfo = lfoWave((float)phase,shp);
-        const float lfoUni = 0.5f*(lfo+1.f);
-
-        if (tgt == Target::Amplitude) {
-            const float gain = 1.f-dep+dep*lfoUni;
-            L[i] *= gain;
-            R[i] *= gain;
-        } else if (tgt == Target::Filter) {
-            constexpr float minC=300.f, maxC=8000.f;
-            const float modC=minC*std::pow(maxC/minC,lfoUni);
-            const float cutoff=juce::jmap(dep,20000.f,modC);
-            const float wanted=std::exp(-2.f*juce::MathConstants<float>::pi*cutoff/(float)sr);
-            // Smooth the coefficient itself to reduce zippering/clicks at high modulation rates.
-            filterCoeff += (wanted-filterCoeff)*0.08f;
-            filterStateL=(1.f-filterCoeff)*L[i]+filterCoeff*filterStateL;
-            filterStateR=(1.f-filterCoeff)*R[i]+filterCoeff*filterStateR;
-            L[i]=filterStateL;
-            R[i]=filterStateR;
-        } else {
-            // Stable modulated-delay vibrato. This remains a vibrato-style pitch effect rather than
-            // a time-domain pitch shifter; the exposed "Pitch" target and its range are unchanged.
-            constexpr float baseMs=15.f, maxModMs=8.f;
-            const float delayMs=baseMs+dep*maxModMs*lfo;
-            const float delaySamples=juce::jlimit(1.f,(float)kPitchDelayBufSize-2.f,delayMs*0.001f*(float)sr);
-            pitchDelayL[(size_t)pitchWriteIdx]=L[i];
-            pitchDelayR[(size_t)pitchWriteIdx]=R[i];
-            auto readInterp=[&](std::array<float,kPitchDelayBufSize>& b)->float {
-                float readPos=(float)pitchWriteIdx-delaySamples;
-                while (readPos<0.f) readPos+=(float)kPitchDelayBufSize;
-                const int i0=(int)readPos;
-                const int i1=(i0+1)%kPitchDelayBufSize;
-                const float frac=readPos-(float)i0;
-                return b[(size_t)i0]*(1.f-frac)+b[(size_t)i1]*frac;
-            };
-            L[i]=readInterp(pitchDelayL);
-            R[i]=readInterp(pitchDelayR);
-            pitchWriteIdx=(pitchWriteIdx+1)%kPitchDelayBufSize;
+        // --- Grain capture: records the input untouched, starting the instant a trigger fires, so
+        // every tap plays back real captured audio, never a synthesized substitute ---
+        if(grainArmed && grainWritePos<grainBufferCapacitySamples){
+            grainBuffer.setSample(0,grainWritePos,L); grainBuffer.setSample(1,grainWritePos,R);
+            ++grainWritePos;
         }
-    }
 
-    uiCurrentRateHz.store(currentRateFor(elapsed));
-    uiElapsedSinceTrigger.store((float)elapsed);
-    uiInputLevelDb.store(juce::Decibels::gainToDecibels(juce::jmax(blockPeak,1.0e-5f)));
-}
-
-juce::AudioProcessorEditor* PDAudioProcessor::createEditor() { return new PDAudioProcessorEditor(*this); }
-
-void PDAudioProcessor::getStateInformation(juce::MemoryBlock& destData) {
-    if (auto xml = apvts.copyState().createXml())
-        copyXmlToBinary(*xml,destData);
-}
-
-void PDAudioProcessor::setStateInformation(const void* data, int size) {
-    if (auto xml = getXmlFromBinary(data,size)) {
-        if (xml->hasTagName(apvts.state.getType())) {
-            apvts.replaceState(juce::ValueTree::fromXml(*xml));
-            syncAtomicsFromParameters();
-            return;
+        // --- Activate any pending tap whose scheduled time has arrived ---
+        juce::int64 absSample=samplePosition+i;
+        for(size_t t=0;t<pendingTaps.size();){
+            if(pendingTaps[t].startSample<=absSample){
+                // FIX (requested): a tap scheduled very soon after the trigger can only ever replay
+                // whatever has actually been captured so far - never more. This isn't a workaround,
+                // it naturally produces shorter, tighter early repeats and fuller later ones, which
+                // is exactly the texture the reference audio has.
+                int availableSoFar=(int)(absSample-pendingTaps[t].triggerSample);
+                int len=juce::jlimit(0,desiredGrainSamples,availableSoFar);
+                if(len>0) activeTaps.push_back({0,len,len,pendingTaps[t].gain});
+                pendingTaps.erase(pendingTaps.begin()+(long)t);
+            } else ++t;
         }
+
+        // --- The ORIGINAL signal passes through completely dry and untouched - this line is the
+        // whole reason the attack is always preserved: nothing above this point has modified L/R. ---
+        float outL=L, outR=R;
+
+        // --- Mix in every currently-active tap's grain playback, with a short raised-cosine fade at
+        // both ends of each tap so starting/stopping playback never clicks ---
+        for(size_t t=0;t<activeTaps.size();){
+            auto& tap=activeTaps[t];
+            if(tap.grainReadPos<grainWritePos && tap.samplesRemaining>0){
+                float fade=1.f;
+                int fadeLen=juce::jmin(kFadeSamples,tap.totalSamples/2);
+                int posIntoTap=tap.totalSamples-tap.samplesRemaining;
+                if(fadeLen>0){
+                    if(posIntoTap<fadeLen) fade=0.5f-0.5f*std::cos(juce::MathConstants<float>::pi*(float)posIntoTap/(float)fadeLen);
+                    else if(tap.samplesRemaining<=fadeLen) fade=0.5f-0.5f*std::cos(juce::MathConstants<float>::pi*(float)tap.samplesRemaining/(float)fadeLen);
+                }
+                float gL=grainBuffer.getSample(0,tap.grainReadPos), gR=grainBuffer.getSample(1,tap.grainReadPos);
+                outL += gL*tap.gain*fade; outR += gR*tap.gain*fade;
+                ++tap.grainReadPos; --tap.samplesRemaining;
+            }
+            if(tap.samplesRemaining<=0) activeTaps.erase(activeTaps.begin()+(long)t); else ++t;
+        }
+
+        b.setSample(0,i,outL); b.setSample(1,i,outR);
     }
 
-    // Backward-compatible loader for v0.1 PDC1 states.
-    juce::MemoryInputStream in(data,(size_t)size,false);
-    if (size >= 4 && in.readInt()==0x50444331) {
-        auto setFloat=[this](const char* id,float v){ if(auto* q=apvts.getParameter(id)) q->setValueNotifyingHost(q->convertTo0to1(v)); };
-        auto setChoice=[this](const char* id,int v){ if(auto* q=apvts.getParameter(id)) q->setValueNotifyingHost(q->convertTo0to1((float)v)); };
-        const bool sync=in.readBool();
-        if(auto* q=apvts.getParameter(pSync)) q->setValueNotifyingHost(q->convertTo0to1(sync?1.f:0.f));
-        setChoice(pStartDiv,in.readInt()); setChoice(pEndDiv,in.readInt());
-        setFloat(pStartHz,in.readFloat()); setFloat(pEndHz,in.readFloat()); setFloat(pDecel,in.readFloat());
-        setChoice(pCurve,in.readInt()); setFloat(pDepth,in.readFloat()); setChoice(pTarget,in.readInt()); setChoice(pShape,in.readInt());
-        syncAtomicsFromParameters();
-    }
+    uiElapsedSinceTrigger.store(uiElapsedSinceTrigger.load()+(float)n/(float)sr);
+    samplePosition+=n;
 }
 
-juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter() { return new PDAudioProcessor(); }
+juce::AudioProcessorEditor* PDAudioProcessor::createEditor(){ return new PDAudioProcessorEditor(*this); }
+
+void PDAudioProcessor::getStateInformation(juce::MemoryBlock& destData){
+    auto state=apvts.copyState();
+    std::unique_ptr<juce::XmlElement> xml(state.createXml());
+    copyXmlToBinary(*xml,destData);
+}
+void PDAudioProcessor::setStateInformation(const void* data,int sizeInBytes){
+    std::unique_ptr<juce::XmlElement> xml(getXmlFromBinary(data,sizeInBytes));
+    if(xml && xml->hasTagName(apvts.state.getType()))
+        apvts.replaceState(juce::ValueTree::fromXml(*xml));
+}
+
+juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){ return new PDAudioProcessor(); }
