@@ -1,5 +1,6 @@
 #pragma once
 #include <JuceHeader.h>
+#include <array>
 
 // PD - "Repeat Pattern" - complete redesign per the reference-audio analysis session:
 // the effect is NOT a continuously-decelerating LFO. It's a fixed rhythmic TAP PATTERN (positions
@@ -69,11 +70,19 @@ public:
     struct VolumePoint { float x, y; };
     static constexpr int kMaxVolumePoints = 6;
     struct VolumeCurve { int count=0; VolumePoint points[kMaxVolumePoints]{}; };
-    VolumeCurve volumeCurves[3]; // per-instance, editable, saved with the project
     static VolumeCurve defaultVolumeCurve(int index); // the flat-start factory default for each slot
     static float evalVolumeCurve(const VolumeCurve&, float x);
+    // FIX (real bug found in review): volumeCurves used to be a plain public array, written directly
+    // by the UI thread's mouseDrag (with the person actively dragging DURING playback - literally the
+    // main use case) while the audio thread read it, unguarded, in scheduleTapsForTrigger(). That's a
+    // genuine data race - a torn read could hand the audio thread a point with an old x paired with a
+    // half-written new y. It's private now, reachable only through these two lock-guarded methods.
+    VolumeCurve getVolumeCurveSnapshot(int curveIdx) const; // safe to call from either thread
+    void setVolumeCurvePointY(int curveIdx, int pointIdx, float y); // UI thread only, but safe regardless
 
 private:
+    VolumeCurve volumeCurves[3]; // per-instance, editable, saved with the project - see accessors above
+    mutable juce::SpinLock volumeCurvesLock; // held only across the tiny copy/write below, never per-sample
     double sr = 44100.0;
 
     // Onset (transient) detector - same fast/slow envelope-follower trigger used in the original PD.
@@ -94,13 +103,26 @@ private:
     bool grainArmed = false;
 
     struct PendingTap { juce::int64 startSample; float gain; juce::int64 triggerSample; juce::int64 maxLenSamples; };
-    struct ActiveTap { int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f; };
+    // FIX (requested #3 - click + volume drop on fast/overlapping notes): a new trigger used to call
+    // activeTaps.clear() on whatever was still playing from the previous note, and clear the grain
+    // buffer right after - so any tap's contribution to the output dropped from its current level
+    // straight to zero on the very next sample. That instantaneous jump is an actual audio
+    // discontinuity - the click. Every ActiveTap now carries a small private "tail" snapshot (copied
+    // out of the grain buffer at the moment it's force-stopped, before that buffer gets reused for
+    // the new note) and a forced linear ramp-to-zero, so an interrupted tap always fades out over a
+    // few milliseconds instead of stopping dead.
+    static constexpr int kForceFadeSamples = 256; // ~5.8ms @44.1kHz - short but click-free
+    struct ActiveTap {
+        int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f;
+        bool forced=false; int forcedTotal=0; // forcedTotal = kForceFadeSamples at the moment of interruption
+        std::array<float,kForceFadeSamples> tailL{}, tailR{}; // only used once forced==true
+    };
     std::vector<PendingTap> pendingTaps;
     std::vector<ActiveTap> activeTaps;
     juce::int64 samplePosition = 0; // running absolute sample counter, never reset
 
     int grainLengthSamplesFor(float desiredMs) const { return (int)std::round(desiredMs*0.001*sr); }
-    static constexpr int kFadeSamples = 48; // short raised-cosine in/out on every tap to avoid clicks
+    static constexpr int kFadeSamples = 48; // short raised-cosine in/out on every tap's OWN natural start/end
 
     void scheduleTapsForTrigger(juce::int64 triggerSample);
 
