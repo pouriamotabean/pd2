@@ -53,8 +53,18 @@ void PDAudioProcessor::prepareToPlay(double sampleRate,int){
 // occupying every slot, until the redesigned preset panel replaces this whole mechanism.
 static PDAudioProcessor::Pattern buildTheOnlyPattern(){
     PDAudioProcessor::Pattern pat{};
+    // FIX (requested - "reach perfection" pass, A/B'd against a 4-measure ours/reference/ours/
+    // reference reference file at 120 BPM): the last tap used to land at 96.5% of the measure - only
+    // ~31ms before the next measure, measured in the actual rendered audio at 98.5% (close enough to
+    // the intended 96.5% once the tap's own short decay is counted). The reference's last audible tap
+    // lands at 89.5%, leaving ~211ms of clear space before the next measure - about 7x more breathing
+    // room. That gap is what makes the reference's ending sound like a deliberate landing rather than
+    // our ending, which ran right up to the edge and blurred into the next repeat's dense opening.
+    // The reference also has a tight little 4-tap "flourish" cluster (86%-89.5%) right before it
+    // stops, which the tail below now mirrors, rather than just truncating the old smooth curve early.
     float p0[]={0.000f,0.007f,0.015f,0.024f,0.034f,0.047f,0.061f,0.078f,0.098f,0.121f,0.147f,0.178f,
-                0.214f,0.256f,0.305f,0.362f,0.429f,0.506f,0.596f,0.701f,0.823f,0.965f};
+                0.214f,0.256f,0.305f,0.362f,0.429f,0.506f,0.596f,0.701f,
+                0.760f,0.815f,0.855f,0.870f,0.882f,0.892f};
     pat.count=(int)(sizeof(p0)/sizeof(p0[0]));
     for(int i=0;i<pat.count;++i) pat.positions[i]=p0[i];
     return pat;
