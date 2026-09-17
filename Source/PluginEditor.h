@@ -12,12 +12,13 @@ public:
     void mouseDown(const juce::MouseEvent&) override;
     void mouseDrag(const juce::MouseEvent&) override;
     void mouseUp(const juce::MouseEvent&) override;
+    void mouseDoubleClick(const juce::MouseEvent&) override;
 
 private:
     PDAudioProcessor& p;
     void timerCallback() override;
 
-    juce::Rectangle<float> patternArea, volumeArea, volumePlotArea;
+    juce::Rectangle<float> patternArea, volumeArea, volumePlotArea, patternLabelHitBox;
     int draggedPointIndex=-1;
 
     // Only the Y of each volume-curve control point is drag-editable for now (X positions are fixed
