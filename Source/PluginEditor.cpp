@@ -1,8 +1,7 @@
 #include "PluginEditor.h"
 
 // =====================================================================================
-// PDButtonLookAndFeel - premium button depth (spec sections 11-13, 27, 83)
-// Only touches drawing. Button behaviour (click/toggle) is 100% unchanged elsewhere.
+// PDButtonLookAndFeel - premium button depth (unchanged from the graphics-upgrade pass)
 // =====================================================================================
 void PDButtonLookAndFeel::drawButtonBackground(juce::Graphics& g, juce::Button& button, const juce::Colour&,
                                                 bool isHighlighted, bool isDown){
@@ -10,30 +9,28 @@ void PDButtonLookAndFeel::drawButtonBackground(juce::Graphics& g, juce::Button& 
     const bool active = button.getToggleState();
     const float radius = 6.0f;
 
-    // Outer dark recess (spec #11) - the button appears to sit slightly INTO the panel
     g.setColour(juce::Colour(0xff080b0f));
     g.fillRoundedRectangle(bounds, radius);
 
-    // Main face - shifts down ~1.5px when pressed (spec #12: 1-2px press shift)
     auto face = bounds.reduced(0.5f).withTrimmedBottom(isDown?0.5f:2.0f);
     if(isDown) face = face.translated(0.f, 1.5f);
 
     juce::Colour faceColour = active ? juce::Colour(0xff1d2633) : juce::Colour(0xff10161e);
-    if(isHighlighted && !isDown) faceColour = faceColour.interpolatedWith(juce::Colour(0xff3a4148), 0.30f);
+    if(!button.isEnabled()) faceColour = juce::Colour(0xff10161e).withAlpha(0.5f);
+    else if(isHighlighted && !isDown) faceColour = faceColour.interpolatedWith(juce::Colour(0xff3a4148), 0.30f);
     g.setColour(faceColour);
     g.fillRoundedRectangle(face, radius);
 
-    // Top highlight - reduced when pressed (spec #12)
     float highlightAlpha = isDown ? 0.08f : (active ? 0.30f : 0.18f);
     juce::Path topHighlight;
     topHighlight.addRoundedRectangle(face.getX(), face.getY(), face.getWidth(), juce::jmax(2.0f,face.getHeight()*0.45f),
                                       radius, radius, true, true, false, false);
-    g.setColour(juce::Colour(0xff313942).withAlpha(highlightAlpha));
+    g.setColour(juce::Colour(0xff313942).withAlpha(button.isEnabled()?highlightAlpha:highlightAlpha*0.4f));
     g.fillPath(topHighlight);
 
-    // Border - accent when active, subtle grid colour otherwise, brightens slightly on hover (spec #13)
     juce::Colour borderColour = active ? juce::Colour(0xff296095) : juce::Colour(0xff313942);
-    if(isHighlighted && !active) borderColour = borderColour.brighter(0.2f);
+    if(!button.isEnabled()) borderColour = borderColour.withAlpha(0.4f);
+    else if(isHighlighted && !active) borderColour = borderColour.brighter(0.2f);
     g.setColour(borderColour);
     g.drawRoundedRectangle(face, radius, active?1.4f:1.0f);
 }
@@ -42,9 +39,10 @@ void PDButtonLookAndFeel::drawButtonText(juce::Graphics& g, juce::TextButton& bu
                                           bool isHighlighted, bool isDown){
     const bool active = button.getToggleState();
     juce::Colour col = active ? juce::Colour(0xff69a1d0) : juce::Colour(0xff6f7a86);
-    if(isHighlighted && !active) col = col.brighter(0.25f);
+    if(!button.isEnabled()) col = col.withAlpha(0.35f);
+    else if(isHighlighted && !active) col = col.brighter(0.25f);
     g.setColour(col);
-    g.setFont(juce::FontOptions(11.5f).withStyle("bold"));
+    g.setFont(juce::FontOptions(10.5f).withStyle("bold"));
     auto bounds = button.getLocalBounds();
     if(isDown) bounds = bounds.translated(0, 1);
     g.drawText(button.getButtonText(), bounds, juce::Justification::centred);
@@ -55,11 +53,10 @@ void PDButtonLookAndFeel::drawButtonText(juce::Graphics& g, juce::TextButton& bu
 // =====================================================================================
 PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProcessorEditor(&proc),p(proc){
     setSize(1260,650);
+    setWantsKeyboardFocus(true);
 
-    // All six buttons share the same premium LookAndFeel and the same behavioural pattern
-    // (setClickingTogglesState + onClick calling setValueNotifyingHost on the real parameter) -
-    // nothing about button BEHAVIOUR changed from before, only how they're drawn.
-    for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&curve1Btn,&curve2Btn,&curve3Btn}){
+    for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&customBtn,
+                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn}){
         addAndMakeVisible(*btn);
         btn->setClickingTogglesState(true);
         btn->setLookAndFeel(&pdLnf);
@@ -70,147 +67,169 @@ PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProc
             a->setValueNotifyingHost(bypassBtn.getToggleState()?1.f:0.f);
     };
 
-    // FIX (requested): Forward/Reverse preset buttons - plain radio behaviour (clicking one selects
-    // it and deselects the other), driven through the same pPattern choice parameter the processor
-    // already reads in scheduleTapsForTrigger(), so host automation of this parameter also updates
-    // these buttons correctly (see updatePatternButtonStates(), called every timer tick).
-    forwardBtn.onClick=[this]{
-        if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPattern)) a->setValueNotifyingHost(0.f);
-        updatePatternButtonStates();
-    };
-    reverseBtn.onClick=[this]{
-        if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPattern)) a->setValueNotifyingHost(1.f);
-        updatePatternButtonStates();
-    };
-    updatePatternButtonStates();
+    // Preset selector: Forward / Reverse (locked, unchanged shapes) / Custom (the new editable one)
+    forwardBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(0.f/2.f); updatePresetButtonStates(); };
+    reverseBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(1.f/2.f); updatePresetButtonStates(); };
+    customBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(2.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); };
+    updatePresetButtonStates();
 
-    // FIX (graphics upgrade): real UI for the pVolumeCurve parameter, which already fully existed and
-    // worked processor-side (getVolumeCurveSnapshot/setVolumeCurvePointY/defaultVolumeCurve all
-    // support 3 independent curve slots) but had no selector control before now. 3-choice parameter,
-    // same setValueNotifyingHost pattern as Forward/Reverse - normalised value = index/(numChoices-1).
-    curve1Btn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pVolumeCurve)) a->setValueNotifyingHost(0.f/2.f); updateCurveButtonStates(); };
-    curve2Btn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pVolumeCurve)) a->setValueNotifyingHost(1.f/2.f); updateCurveButtonStates(); };
-    curve3Btn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pVolumeCurve)) a->setValueNotifyingHost(2.f/2.f); updateCurveButtonStates(); };
-    updateCurveButtonStates();
+    // Edit-mode buttons (spec section 2) - only VOLUME is wired up in Phase 1. The other four are
+    // shown (so the final 5-button layout already exists) but disabled until their phases land, with
+    // a tooltip saying so rather than silently doing nothing.
+    volumeModeBtn.setToggleState(true,juce::dontSendNotification);
+    volumeModeBtn.setEnabled(true);
+    for(auto* btn:{&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn}){
+        btn->setEnabled(false);
+        btn->setTooltip("Coming in a later phase - see the phased build plan.");
+    }
 
+    snapBtn.setToggleState(snapEnabled,juce::dontSendNotification);
+    snapBtn.setTooltip("Snap repeat position to the beat grid while dragging.");
+    snapBtn.onClick=[this]{ snapEnabled=snapBtn.getToggleState(); };
+
+    refreshWorkingPatternFromProcessor();
     startTimerHz(30);
 }
 PDAudioProcessorEditor::~PDAudioProcessorEditor(){
     stopTimer();
-    for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&curve1Btn,&curve2Btn,&curve3Btn}) btn->setLookAndFeel(nullptr);
+    for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&customBtn,
+                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn})
+        btn->setLookAndFeel(nullptr);
 }
 
-void PDAudioProcessorEditor::updatePatternButtonStates(){
-    // FIX (spec #57 - avoid UI state desync): read directly from the parameter every time, never
-    // cache a separate bool - APVTS stays the single source of truth, so host automation is always
-    // reflected correctly here.
-    int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPattern)->load();
-    forwardBtn.setToggleState(idx==0,juce::dontSendNotification);
-    reverseBtn.setToggleState(idx==1,juce::dontSendNotification);
+bool PDAudioProcessorEditor::isCustomPresetActive() const {
+    return (int)p.apvts.getRawParameterValue(PDAudioProcessor::pPreset)->load()==(int)PDAudioProcessor::kPresetCustom;
 }
-void PDAudioProcessorEditor::updateCurveButtonStates(){
-    int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    curve1Btn.setToggleState(idx==0,juce::dontSendNotification);
-    curve2Btn.setToggleState(idx==1,juce::dontSendNotification);
-    curve3Btn.setToggleState(idx==2,juce::dontSendNotification);
+void PDAudioProcessorEditor::refreshWorkingPatternFromProcessor(){
+    workingPattern = p.getCustomPatternForEditing();
+}
+void PDAudioProcessorEditor::commitWorkingPattern(){
+    p.commitCustomPattern(workingPattern);
 }
 
-float PDAudioProcessorEditor::currentMeasureFraction() const {
-    // FIX (graphics upgrade, spec #61/#62): read-only computation from existing safe atomics - no new
-    // processor state, no processor logic touched, paint() stays purely a reader.
-    double bpm=p.uiBpm.load();
+void PDAudioProcessorEditor::updatePresetButtonStates(){
+    int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPreset)->load();
+    forwardBtn.setToggleState(idx==(int)PDAudioProcessor::kPresetForward,juce::dontSendNotification);
+    reverseBtn.setToggleState(idx==(int)PDAudioProcessor::kPresetReverse,juce::dontSendNotification);
+    customBtn.setToggleState(idx==(int)PDAudioProcessor::kPresetCustom,juce::dontSendNotification);
+}
+
+// ---- Geometry <-> value mapping (Phase 1: VOLUME mode) --------------------------------------
+float PDAudioProcessorEditor::xToPosition(float x) const {
+    if(graphArea.getWidth()<=0.f) return 0.f;
+    return juce::jlimit(0.f,1.f,(x-graphArea.getX())/graphArea.getWidth());
+}
+float PDAudioProcessorEditor::positionToX(float position) const {
+    return graphArea.getX()+graphArea.getWidth()*juce::jlimit(0.f,1.f,position);
+}
+float PDAudioProcessorEditor::yToVolumeDb(float y) const {
+    float halfH=graphArea.getHeight()*0.5f;
+    if(halfH<=0.f) return 0.f;
+    float db = -(y-graphArea.getCentreY())/halfH*12.f;
+    return juce::jlimit(-12.f,12.f,db);
+}
+float PDAudioProcessorEditor::volumeDbToY(float db) const {
+    float halfH=graphArea.getHeight()*0.5f;
+    return graphArea.getCentreY() - (juce::jlimit(-12.f,12.f,db)/12.f)*halfH;
+}
+juce::Point<float> PDAudioProcessorEditor::eventHandlePoint(const PDAudioProcessor::RepeatEvent& e) const {
+    return { positionToX(e.position), volumeDbToY(e.volumeDb) };
+}
+float PDAudioProcessorEditor::snappedPosition(float rawPosition) const {
+    if(!snapEnabled) return rawPosition;
     int numBeats=juce::jmax(1,p.uiTimeSigNumerator.load());
-    double measureSec=(60.0/juce::jmax(1.0,bpm))*numBeats;
-    if(measureSec<=0.0) return 999.f;
-    return (float)((double)p.uiElapsedSinceTrigger.load()/measureSec);
+    int divisions=numBeats*4; // spec section 19: a subtle 1/16-of-a-bar grid
+    float step=1.0f/(float)divisions;
+    return juce::jlimit(0.f,1.f,std::round(rawPosition/step)*step);
 }
 
-void PDAudioProcessorEditor::timerCallback(){
-    updatePatternButtonStates();
-    updateCurveButtonStates();
-    repaint();
-}
-
-static void drawRuler(juce::Graphics& g,juce::Rectangle<float> r,int numBeats,juce::Colour tickCol,juce::Colour textCol){
-    g.setColour(tickCol.withAlpha(0.4f));
-    const int kSubTicksPerBeat=4;
-    for(int i=0;i<=numBeats*kSubTicksPerBeat;++i){
-        float t=(float)i/(float)(numBeats*kSubTicksPerBeat);
-        float x=r.getX()+r.getWidth()*t;
-        bool major=(i%kSubTicksPerBeat)==0;
-        g.setColour(tickCol.withAlpha(major?0.4f:0.18f));
-        g.drawLine(x,r.getY(),x,r.getY()+(major?10.f:6.f),major?1.4f:1.f);
-    }
-    g.setColour(textCol); g.setFont(juce::FontOptions(9.5f).withStyle("bold"));
-    for(int b=0;b<=numBeats;++b){
-        float t=(float)b/(float)numBeats;
-        float x=r.getX()+r.getWidth()*t;
-        juce::String label = (b==numBeats) ? "2.1" : ("1."+juce::String(b+1));
-        g.drawText(label,x-24.f,r.getY()+14.f,48.f,14.f, b==0?juce::Justification::left:(b==numBeats?juce::Justification::right:juce::Justification::centred));
-    }
-}
-
-juce::Point<float> PDAudioProcessorEditor::volumePointToScreen(const PDAudioProcessor::VolumeCurve& c,int index) const {
-    const auto& pt=c.points[index];
-    float x=volumePlotArea.getX()+volumePlotArea.getWidth()*pt.x;
-    // y range mapped: gain 0 -> bottom, gain 1.3 -> top (a little headroom above unity for "boosted" points)
-    float norm=juce::jlimit(0.f,1.f,pt.y/1.3f);
-    float y=volumePlotArea.getBottom()-volumePlotArea.getHeight()*norm;
-    return {x,y};
-}
-int PDAudioProcessorEditor::hitTestVolumePoint(juce::Point<float> pos) const {
-    // FIX (spec #37 - hit test bounds): only hit-test inside volumePlotArea, so mouse interaction
-    // elsewhere (header, buttons, pattern panel, footer) can never be mistaken for a curve drag.
-    if(!volumePlotArea.expanded(12.f).contains(pos)) return -1;
-    int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    const auto c=p.getVolumeCurveSnapshot(idx);
-    for(int i=0;i<c.count;++i){
-        auto sp=volumePointToScreen(c,i);
-        if(sp.getDistanceFrom(pos)<12.f) return i;
+int PDAudioProcessorEditor::hitTestHandle(juce::Point<float> pos) const {
+    for(int i=0;i<workingPattern.count;++i){
+        if(eventHandlePoint(workingPattern.events[i]).getDistanceFrom(pos)<11.f) return i;
     }
     return -1;
 }
+int PDAudioProcessorEditor::hitTestBody(juce::Point<float> pos) const {
+    if(!graphArea.contains(pos)) return -1;
+    for(int i=0;i<workingPattern.count;++i){
+        float x=positionToX(workingPattern.events[i].position);
+        if(std::abs(pos.x-x)>7.f) continue;
+        float y0=graphArea.getCentreY(), y1=volumeDbToY(workingPattern.events[i].volumeDb);
+        float top=juce::jmin(y0,y1)-4.f, bottom=juce::jmax(y0,y1)+4.f;
+        if(pos.y>=top && pos.y<=bottom) return i;
+    }
+    return -1;
+}
+
 void PDAudioProcessorEditor::mouseDown(const juce::MouseEvent& e){
-    draggedPointIndex=hitTestVolumePoint(e.position);
+    grabKeyboardFocus();
+    if(!isCustomPresetActive()) return; // Forward/Reverse are locked - not editable (per request)
+    if(!graphArea.expanded(14.f).contains(e.position)) return;
+    refreshWorkingPatternFromProcessor();
+
+    // Interaction priority (spec #10/#22): handle before body before empty space.
+    int h=hitTestHandle(e.position);
+    if(h>=0){ draggedEventIndex=h; dragMode=DragMode::Value; selectedEventIndex=h; repaint(); return; }
+
+    int bIdx=hitTestBody(e.position);
+    if(bIdx>=0){ draggedEventIndex=bIdx; dragMode=DragMode::Position; selectedEventIndex=bIdx; repaint(); return; }
+
+    // Empty space -> create a new Repeat (spec section 9)
+    if(workingPattern.count>=PDAudioProcessor::kMaxRepeats) return; // full - ignore rather than overflow
+    int idx=workingPattern.count++;
+    auto& ev=workingPattern.events[idx];
+    ev=PDAudioProcessor::RepeatEvent{};
+    ev.id=idx;
+    ev.position=snappedPosition(xToPosition(e.position.x));
+    ev.volumeDb=yToVolumeDb(e.position.y);
+    draggedEventIndex=idx; dragMode=DragMode::Value; selectedEventIndex=idx;
+    commitWorkingPattern();
+    repaint();
 }
 void PDAudioProcessorEditor::mouseDrag(const juce::MouseEvent& e){
-    if(draggedPointIndex<0) return;
-    int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    float norm=juce::jlimit(0.f,1.f,(volumePlotArea.getBottom()-e.position.y)/volumePlotArea.getHeight());
-    p.setVolumeCurvePointY(idx,draggedPointIndex,juce::jlimit(0.f,1.3f,norm*1.3f));
+    if(draggedEventIndex<0 || draggedEventIndex>=workingPattern.count) return;
+    auto& ev=workingPattern.events[draggedEventIndex];
+    if(dragMode==DragMode::Value) ev.volumeDb=yToVolumeDb(e.position.y);
+    else if(dragMode==DragMode::Position) ev.position=snappedPosition(xToPosition(e.position.x));
+    commitWorkingPattern();
     repaint();
 }
 void PDAudioProcessorEditor::mouseUp(const juce::MouseEvent&){
-    // FIX (spec #38 - mouse state safety): always reset drag state on mouseUp, including if the
-    // mouse was dragged outside the graph area before release - draggedPointIndex is set to -1
-    // unconditionally here regardless of where the cursor ended up.
-    draggedPointIndex=-1;
+    draggedEventIndex=-1; dragMode=DragMode::None;
 }
 void PDAudioProcessorEditor::mouseMove(const juce::MouseEvent& e){
-    int hit=hitTestVolumePoint(e.position);
-    if(hit!=hoveredPointIndex){ hoveredPointIndex=hit; repaint(); }
+    int h = isCustomPresetActive() ? hitTestHandle(e.position) : -1;
+    if(h!=hoveredEventIndex){ hoveredEventIndex=h; repaint(); }
+    if(!isCustomPresetActive()) { setMouseCursor(juce::MouseCursor::NormalCursor); return; }
+    if(h>=0) setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+    else if(hitTestBody(e.position)>=0) setMouseCursor(juce::MouseCursor::DraggingHandCursor);
+    else if(graphArea.contains(e.position)) setMouseCursor(juce::MouseCursor::CrosshairCursor);
+    else setMouseCursor(juce::MouseCursor::NormalCursor);
 }
 void PDAudioProcessorEditor::mouseExit(const juce::MouseEvent&){
-    if(hoveredPointIndex!=-1){ hoveredPointIndex=-1; repaint(); }
+    if(hoveredEventIndex!=-1){ hoveredEventIndex=-1; repaint(); }
 }
-void PDAudioProcessorEditor::mouseDoubleClick(const juce::MouseEvent& e){
-    // FIX (requested): double-clicking a volume-curve node resets JUST that node back to flat
-    // (gain 1.0) - a quick way to undo one point's edit without resetting the whole curve.
-    int hit=hitTestVolumePoint(e.position);
-    if(hit>=0){
-        int idx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-        p.setVolumeCurvePointY(idx,hit,1.0f);
-        // FIX (spec #36): brief visual flash on the reset point, purely cosmetic editor-local state.
-        flashedPointIndex=hit; flashUntilMs=juce::Time::getMillisecondCounter()+100;
+bool PDAudioProcessorEditor::keyPressed(const juce::KeyPress& k){
+    if((k==juce::KeyPress::deleteKey || k==juce::KeyPress::backspaceKey)
+        && isCustomPresetActive() && selectedEventIndex>=0 && selectedEventIndex<workingPattern.count){
+        for(int i=selectedEventIndex;i<workingPattern.count-1;++i) workingPattern.events[i]=workingPattern.events[i+1];
+        --workingPattern.count;
+        selectedEventIndex=-1; draggedEventIndex=-1; dragMode=DragMode::None;
+        commitWorkingPattern();
         repaint();
+        return true;
     }
-    // FIX (requested #1): the double-click pattern-switcher stays removed - there's a real, visible
-    // Forward/Reverse selector now, so no gesture is required or hidden here (spec #54).
+    return false;
 }
 
-// ---- Premium drawing helpers (spec #69, #42-45) ----------------------------------------------
+void PDAudioProcessorEditor::timerCallback(){
+    updatePresetButtonStates();
+    if(dragMode==DragMode::None) refreshWorkingPatternFromProcessor(); // stay in sync without clobbering a live drag
+    repaint();
+}
+
+// ---- Drawing --------------------------------------------------------------------------------
 void PDAudioProcessorEditor::drawPremiumPanel(juce::Graphics& g, juce::Rectangle<float> bounds, float radius) const {
-    // 4-layer depth system (spec #42): recess edge -> panel fill -> border -> subtle top inner highlight
     g.setColour(recess()); g.fillRoundedRectangle(bounds.expanded(1.0f), radius);
     g.setColour(panel()); g.fillRoundedRectangle(bounds, radius);
     juce::Path topHighlight;
@@ -219,36 +238,24 @@ void PDAudioProcessorEditor::drawPremiumPanel(juce::Graphics& g, juce::Rectangle
     g.setColour(raised().withAlpha(0.18f)); g.fillPath(topHighlight);
     g.setColour(border()); g.drawRoundedRectangle(bounds,radius,1.0f);
 }
-void PDAudioProcessorEditor::drawRecessedGraph(juce::Graphics& g, juce::Rectangle<float> bounds, float radius) const {
-    g.setColour(recess()); g.fillRoundedRectangle(bounds.expanded(1.0f),radius);
-    g.setColour(secondaryBg()); g.fillRoundedRectangle(bounds,radius);
-    g.setColour(border().withAlpha(0.6f)); g.drawRoundedRectangle(bounds,radius,1.0f);
-}
 
-void PDAudioProcessorEditor::drawHeader(juce::Graphics& g, juce::Rectangle<float>) const {
+void PDAudioProcessorEditor::drawHeader(juce::Graphics& g) const {
     g.setColour(text()); g.setFont(juce::FontOptions(31.f).withStyle("bold"));
     g.drawText("PD",28.f,18.f,90.f,38.f,juce::Justification::left);
-
-    // Thin vertical accent line beside PD (spec #6) - deliberately understated, not dominant
     g.setColour(accent().withAlpha(0.7f));
     g.fillRect(122.f,24.f,1.6f,32.f);
-
     g.setColour(secondaryText()); g.setFont(juce::FontOptions(12.5f).withStyle("bold"));
     g.drawText("REPEAT PATTERN",140.f,20.f,260.f,20.f,juce::Justification::left);
     g.setColour(muted()); g.setFont(juce::FontOptions(9.5f));
-    g.drawText("RHYTHMIC GRAIN ENGINE",140.f,39.f,260.f,16.f,juce::Justification::left);
-
-    // Very faint separator under the whole header (spec #7)
+    g.drawText("INTERACTIVE PATTERN EDITOR",140.f,39.f,260.f,16.f,juce::Justification::left);
     g.setColour(border().withAlpha(0.3f));
     g.drawLine(24.f,66.f,(float)getWidth()-24.f,66.f,1.0f);
 }
 
 void PDAudioProcessorEditor::drawBpmStatus(juce::Graphics& g, juce::Rectangle<float> box) const {
     drawPremiumPanel(g,box,9.f);
-    // FIX (spec #9): micro-animation window derived from uiElapsedSinceTrigger - no new timer, uses
-    // the existing 30Hz UI timer already running for everything else.
     float elapsed=p.uiElapsedSinceTrigger.load();
-    bool recent = elapsed<0.22f; // spec suggests 150-250ms pulse window
+    bool recent = elapsed<0.22f;
     juce::Colour dotColour = recent ? sidePeak() : accentHighlight().withAlpha(0.55f);
     g.setColour(dotColour); g.fillEllipse(box.getX()+15.f,box.getCentreY()-4.5f,9.f,9.f);
     if(recent){
@@ -259,183 +266,156 @@ void PDAudioProcessorEditor::drawBpmStatus(juce::Graphics& g, juce::Rectangle<fl
     g.drawText(juce::String(p.uiBpm.load(),1)+" BPM",box.getX()+32.f,box.getY(),box.getWidth()-40.f,box.getHeight(),juce::Justification::centredLeft);
 }
 
-void PDAudioProcessorEditor::drawPatternPanel(juce::Graphics& g) const {
-    drawPremiumPanel(g,patternArea,10.f);
+void PDAudioProcessorEditor::drawEditorPanel(juce::Graphics& g) const {
+    drawPremiumPanel(g,editorPanelArea,10.f);
+
+    bool custom=isCustomPresetActive();
+    int presetIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPreset)->load();
+    const auto& displayPattern = custom ? workingPattern
+        : PDAudioProcessor::getLockedPreset(presetIdx==(int)PDAudioProcessor::kPresetReverse?1:0);
+
     g.setColour(secondaryText()); g.setFont(juce::FontOptions(11.5f).withStyle("bold"));
-    g.drawText("PATTERN",patternArea.getX()+16.f,patternArea.getY()+10.f,160.f,16.f,juce::Justification::left);
-
-    int patIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPattern)->load();
-    const auto& pat=PDAudioProcessor::getPattern(patIdx);
-    int numBeats=juce::jmax(1,p.uiTimeSigNumerator.load());
-
-    // Spec #17: small meta line under the title
+    g.drawText("VOLUME",editorPanelArea.getX()+16.f,editorPanelArea.getY()+8.f,160.f,16.f,juce::Justification::left);
     g.setColour(muted()); g.setFont(juce::FontOptions(9.5f));
-    juce::String meta = juce::String(pat.count)+" TRIGGERS  \u2022  1 BAR";
-    g.drawText(meta,patternArea.getX()+16.f,patternArea.getY()+27.f,240.f,14.f,juce::Justification::left);
-
-    drawRecessedGraph(g,patternGraphArea,7.f);
-    auto tickArea=patternGraphArea.reduced(16.f,10.f);
-    drawPatternGraph(g,tickArea,pat);
-    drawRuler(g,{tickArea.getX(),patternGraphArea.getBottom()+8.f,tickArea.getWidth(),22.f},numBeats,border(),muted());
-}
-
-void PDAudioProcessorEditor::drawPatternGraph(juce::Graphics& g, juce::Rectangle<float> tickArea, const PDAudioProcessor::Pattern& pat) const {
-    g.setColour(border().withAlpha(0.5f));
-    g.drawLine(tickArea.getX(),tickArea.getBottom(),tickArea.getRight(),tickArea.getBottom(),1.0f);
-
-    if(pat.count==0){
-        // FIX (spec #22): calm, non-error-looking empty state
-        g.setColour(muted()); g.setFont(juce::FontOptions(11.5f));
-        g.drawText("NO PATTERN DATA",tickArea,juce::Justification::centred);
-        return;
+    juce::String meta = juce::String(displayPattern.count)+" REPEATS  \u2022  1 BAR";
+    if(!custom) meta += "  \u2022  LOCKED";
+    g.drawText(meta,editorPanelArea.getX()+16.f,editorPanelArea.getY()+24.f,320.f,14.f,juce::Justification::left);
+    if(custom && displayPattern.count==0){
+        g.setColour(muted()); g.setFont(juce::FontOptions(9.5f));
+        g.drawText("click in the graph to add a repeat",editorPanelArea.getRight()-260.f,editorPanelArea.getY()+24.f,244.f,14.f,juce::Justification::right);
     }
 
-    const float measureFrac=currentMeasureFraction();
-    const bool notePlaying = measureFrac>=0.f && measureFrac<1.05f; // roughly "within this cycle"
+    drawGraph(g);
+}
+
+void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
+    // Recessed inner surface
+    g.setColour(recess()); g.fillRoundedRectangle(graphArea.expanded(1.0f),7.f);
+    g.setColour(secondaryBg()); g.fillRoundedRectangle(graphArea,7.f);
+    g.setColour(border().withAlpha(0.6f)); g.drawRoundedRectangle(graphArea,7.f,1.0f);
+
+    // dB reference gridlines: -12/-6/0(+6/+12) - 0dB drawn brighter as the actual baseline
+    for(float dbLine : {-12.f,-6.f,0.f,6.f,12.f}){
+        float y=volumeDbToY(dbLine);
+        g.setColour(border().withAlpha(dbLine==0.f?0.5f:0.18f));
+        g.drawLine(graphArea.getX(),y,graphArea.getRight(),y,dbLine==0.f?1.3f:1.0f);
+        g.setColour(muted().withAlpha(0.8f)); g.setFont(juce::FontOptions(8.5f));
+        juce::String lbl = (dbLine==0.f?"0":(dbLine>0?"+":"")+juce::String((int)dbLine));
+        g.drawText(lbl,graphArea.getX()-26.f,y-6.f,22.f,12.f,juce::Justification::right);
+    }
+
+    bool custom=isCustomPresetActive();
+    int presetIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pPreset)->load();
+    const auto& pat = custom ? workingPattern
+        : PDAudioProcessor::getLockedPreset(presetIdx==(int)PDAudioProcessor::kPresetReverse?1:0);
+
+    // Live trigger position (read-only, from existing safe atomics) for a brief highlight pulse
+    double bpm=p.uiBpm.load(); int numBeats=juce::jmax(1,p.uiTimeSigNumerator.load());
+    double measureSec=(60.0/juce::jmax(1.0,bpm))*numBeats;
+    float measureFrac = measureSec>0.0 ? (float)((double)p.uiElapsedSinceTrigger.load()/measureSec) : 999.f;
+
     for(int i=0;i<pat.count;++i){
-        float x=tickArea.getX()+tickArea.getWidth()*pat.positions[i];
-        // FIX (spec #18/#20/#61/#62): highlight the tap that playback has JUST passed, computed
-        // read-only from live atomics - never a guessed/fabricated trigger index. Window kept small
-        // (~6% of the measure) so only one (or zero) taps are ever lit at a time.
-        bool active = notePlaying && measureFrac>=pat.positions[i] && measureFrac<pat.positions[i]+0.06f;
-        if(active){
+        const auto& ev=pat.events[i];
+        if(!ev.enabled) continue;
+        auto handle=eventHandlePoint(ev);
+        float baseline=graphArea.getCentreY();
+        bool selected = custom && (i==selectedEventIndex);
+        bool hovered = custom && (i==hoveredEventIndex) && !selected;
+        bool activeNow = measureFrac>=ev.position && measureFrac<ev.position+0.05f;
+
+        juce::Colour barColour = activeNow ? sidePeak() : (selected ? accentHighlight() : accent());
+        if(activeNow){
             g.setColour(sidePeak().withAlpha(0.12f));
-            g.fillRoundedRectangle(x-4.f,tickArea.getY(),8.f,tickArea.getHeight(),3.f);
+            g.fillRoundedRectangle(handle.x-4.f,juce::jmin(baseline,handle.y),8.f,std::abs(handle.y-baseline),3.f);
         }
-        g.setColour(active?sidePeak():accent());
-        g.drawLine(x,tickArea.getY(),x,tickArea.getBottom(),active?2.0f:1.6f);
-    }
-}
+        g.setColour(barColour);
+        g.drawLine(handle.x,baseline,handle.x,handle.y,selected?2.4f:1.8f);
 
-void PDAudioProcessorEditor::drawVolumePanel(juce::Graphics& g) const {
-    drawPremiumPanel(g,volumeArea,10.f);
-    g.setColour(secondaryText()); g.setFont(juce::FontOptions(11.5f).withStyle("bold"));
-    g.drawText("VOLUME CURVE",volumeArea.getX()+16.f,volumeArea.getY()+10.f,200.f,16.f,juce::Justification::left);
+        float r = selected?7.f:(hovered?6.5f:5.5f);
+        g.setColour(secondaryBg()); g.fillEllipse(handle.x-r,handle.y-r,r*2.f,r*2.f);
+        g.setColour(selected?text():(hovered?accentHighlight():barColour));
+        g.drawEllipse(handle.x-r,handle.y-r,r*2.f,r*2.f,selected?2.0f:1.4f);
 
-    int curveIdx=(int)p.apvts.getRawParameterValue(PDAudioProcessor::pVolumeCurve)->load();
-    const auto curve=p.getVolumeCurveSnapshot(curveIdx);
-    g.setColour(muted()); g.setFont(juce::FontOptions(9.5f));
-    g.drawText(juce::String(curve.count)+" POINTS  \u2022  drag to reshape, double-click to reset",
-                volumeArea.getX()+16.f,volumeArea.getY()+27.f,340.f,14.f,juce::Justification::left);
-
-    drawRecessedGraph(g,volumePlotArea.expanded(16.f,10.f),7.f);
-
-    int numBeats=juce::jmax(1,p.uiTimeSigNumerator.load());
-
-    // Reference gridlines (spec #31)
-    for(float gval:{0.5f,1.0f}){
-        float y=volumePlotArea.getBottom()-volumePlotArea.getHeight()*(gval/1.3f);
-        g.setColour(border().withAlpha(gval>=1.0f?0.4f:0.18f));
-        g.drawLine(volumePlotArea.getX(),y,volumePlotArea.getRight(),y,1.0f);
-    }
-
-    juce::Path curvePath;
-    const int N=200;
-    for(int i=0;i<=N;++i){
-        float t=(float)i/N;
-        float gval=PDAudioProcessor::evalVolumeCurve(curve,t);
-        float x=volumePlotArea.getX()+volumePlotArea.getWidth()*t;
-        float y=volumePlotArea.getBottom()-volumePlotArea.getHeight()*juce::jlimit(0.f,1.f,gval/1.3f);
-        if(i==0) curvePath.startNewSubPath(x,y); else curvePath.lineTo(x,y);
-    }
-
-    // Subtle area fill under the curve (spec #30) - visual depth only, no DSP relevance whatsoever
-    {
-        juce::Path fillPath(curvePath);
-        fillPath.lineTo(volumePlotArea.getRight(),volumePlotArea.getBottom());
-        fillPath.lineTo(volumePlotArea.getX(),volumePlotArea.getBottom());
-        fillPath.closeSubPath();
-        g.setGradientFill(juce::ColourGradient(accent().withAlpha(0.16f),0,volumePlotArea.getY(),
-                                                accent().withAlpha(0.0f),0,volumePlotArea.getBottom(),false));
-        g.fillPath(fillPath);
-    }
-    // Very subtle glow under the curve line (spec #29) - drawn as a soft wide stroke behind the crisp one
-    g.setColour(accent().withAlpha(0.08f));
-    g.strokePath(curvePath,juce::PathStrokeType(6.0f));
-    g.setColour(accentHighlight());
-    g.strokePath(curvePath,juce::PathStrokeType(2.2f));
-
-    juce::uint32 now=juce::Time::getMillisecondCounter();
-    for(int i=0;i<curve.count;++i){
-        auto sp=volumePointToScreen(curve,i);
-        bool dragging=(draggedPointIndex==i);
-        bool hovered=(hoveredPointIndex==i) && !dragging;
-        bool flashing=(flashedPointIndex==i) && now<flashUntilMs;
-
-        if(hovered||dragging||flashing){
-            g.setColour(accent().withAlpha(0.13f));
-            g.fillEllipse(sp.x-11.f,sp.y-11.f,22.f,22.f);
-        }
-        float outerR = dragging?8.f:(hovered?7.5f:7.f);
-        g.setColour(secondaryBg()); g.fillEllipse(sp.x-outerR,sp.y-outerR,outerR*2.f,outerR*2.f);
-        g.setColour(dragging?text():(hovered?accentHighlight():border()));
-        g.drawEllipse(sp.x-outerR,sp.y-outerR,outerR*2.f,outerR*2.f,dragging?2.2f:1.6f);
-        g.setColour(accentHighlight());
-        g.fillEllipse(sp.x-3.f,sp.y-3.f,6.f,6.f);
-
-        if(dragging){
-            // Live floating value label (spec #35) - flips above the point if too close to the panel top
-            juce::String label="GAIN";
-            juce::String value=juce::String(curve.points[i].y,2)+" \u00d7";
-            float boxW=76.f,boxH=34.f;
-            float bx=juce::jlimit(volumePlotArea.getX(),volumePlotArea.getRight()-boxW,sp.x-boxW*0.5f);
-            float by=sp.y-boxH-14.f;
-            if(by<volumePlotArea.getY()) by=sp.y+14.f; // flip below if it would go above the panel
+        if(selected && dragMode!=DragMode::None){
+            juce::String label = dragMode==DragMode::Value
+                ? juce::String(ev.volumeDb,1)+" dB"
+                : juce::String((int)std::round(ev.position*100.f))+"%";
+            float boxW=64.f,boxH=20.f;
+            float bx=juce::jlimit(graphArea.getX(),graphArea.getRight()-boxW,handle.x-boxW*0.5f);
+            float by=handle.y-boxH-12.f;
+            if(by<graphArea.getY()) by=handle.y+12.f;
             juce::Rectangle<float> box(bx,by,boxW,boxH);
-            g.setColour(recess()); g.fillRoundedRectangle(box,5.f);
-            g.setColour(border()); g.drawRoundedRectangle(box,5.f,1.0f);
-            g.setColour(muted()); g.setFont(juce::FontOptions(8.5f).withStyle("bold"));
-            g.drawText(label,box.getX()+7.f,box.getY()+4.f,box.getWidth()-14.f,12.f,juce::Justification::left);
-            g.setColour(text()); g.setFont(juce::FontOptions(13.f).withStyle("bold"));
-            g.drawText(value,box.getX()+7.f,box.getY()+16.f,box.getWidth()-14.f,16.f,juce::Justification::left);
+            g.setColour(recess()); g.fillRoundedRectangle(box,4.f);
+            g.setColour(border()); g.drawRoundedRectangle(box,4.f,1.0f);
+            g.setColour(text()); g.setFont(juce::FontOptions(11.5f).withStyle("bold"));
+            g.drawText(label,box,juce::Justification::centred);
         }
     }
-    drawRuler(g,{volumePlotArea.getX(),volumePlotArea.getBottom()+18.f,volumePlotArea.getWidth(),22.f},numBeats,border(),muted());
+
+    // Ruler
+    int numBeatsForRuler=juce::jmax(1,p.uiTimeSigNumerator.load());
+    auto rulerArea=juce::Rectangle<float>(graphArea.getX(),graphArea.getBottom()+6.f,graphArea.getWidth(),18.f);
+    g.setColour(border().withAlpha(0.35f));
+    const int subTicks=4;
+    for(int i=0;i<=numBeatsForRuler*subTicks;++i){
+        float t=(float)i/(float)(numBeatsForRuler*subTicks);
+        float x=rulerArea.getX()+rulerArea.getWidth()*t;
+        bool major=(i%subTicks)==0;
+        g.setColour(border().withAlpha(major?0.4f:0.15f));
+        g.drawLine(x,rulerArea.getY(),x,rulerArea.getY()+(major?7.f:4.f),1.0f);
+    }
+    g.setColour(muted()); g.setFont(juce::FontOptions(8.5f).withStyle("bold"));
+    for(int b=0;b<=numBeatsForRuler;++b){
+        float t=(float)b/(float)numBeatsForRuler;
+        float x=rulerArea.getX()+rulerArea.getWidth()*t;
+        juce::String label=(b==numBeatsForRuler)?"2.1":("1."+juce::String(b+1));
+        g.drawText(label,x-20.f,rulerArea.getY()+8.f,40.f,10.f,
+                   b==0?juce::Justification::left:(b==numBeatsForRuler?juce::Justification::right:juce::Justification::centred));
+    }
+
+    if(!custom){
+        g.setColour(muted().withAlpha(0.65f)); g.setFont(juce::FontOptions(10.f));
+        g.drawText("select CUSTOM to edit",graphArea.getRight()-150.f,graphArea.getY()+6.f,140.f,16.f,juce::Justification::right);
+    }
 }
 
 void PDAudioProcessorEditor::drawFooter(juce::Graphics& g, juce::Rectangle<float> area) const {
     g.setColour(border().withAlpha(0.25f));
     g.drawLine(area.getX(),area.getY(),area.getRight(),area.getY(),1.0f);
     g.setColour(muted()); g.setFont(juce::FontOptions(9.f));
-    g.drawText("PD  \u2022  RHYTHMIC GRAIN ENGINE",area.getX(),area.getY()+4.f,400.f,area.getHeight()-4.f,juce::Justification::left);
+    g.drawText("PD  \u2022  INTERACTIVE PATTERN EDITOR",area.getX(),area.getY()+4.f,400.f,area.getHeight()-4.f,juce::Justification::left);
     g.setColour(secondaryText()); g.setFont(juce::FontOptions(9.f).withStyle("bold"));
     juce::String grain="GRAIN "+juce::String((int)std::round(p.apvts.getRawParameterValue(PDAudioProcessor::pGrainMs)->load()))+" ms";
     g.drawText(grain,area.getRight()-160.f,area.getY()+4.f,160.f,area.getHeight()-4.f,juce::Justification::right);
 }
 
 void PDAudioProcessorEditor::paint(juce::Graphics& g){
-    // FIX (spec #81 - paint must be read-only): this function only ever calls p.<atomic>.load(),
-    // p.getVolumeCurveSnapshot() (a copy) and PDAudioProcessor::getPattern()/evalVolumeCurve() (pure,
-    // static, read-only). Nothing here mutates a parameter, curve, or pattern.
     g.fillAll(bg());
-    auto a=getLocalBounds().toFloat();
-
-    drawHeader(g,a);
-
-    juce::Rectangle<float> bpmBox(a.getRight()-300.f,20.f,150.f,36.f);
+    drawHeader(g);
+    juce::Rectangle<float> bpmBox((float)getWidth()-300.f,20.f,150.f,36.f);
     drawBpmStatus(g,bpmBox);
-
-    drawPatternPanel(g);
-    drawVolumePanel(g);
-
+    drawEditorPanel(g);
     drawFooter(g,{24.f,(float)getHeight()-26.f,(float)getWidth()-48.f,22.f});
 }
 
 void PDAudioProcessorEditor::resized(){
-    const int w=getWidth();
-    bypassBtn.setBounds(w-112,66,88,28);
+    const int w=getWidth(), h=getHeight();
+    bypassBtn.setBounds(w-112,20,88,28);
 
-    patternArea={24.f,84.f,(float)w-48.f,250.f};
-    volumeArea={24.f,352.f,(float)w-48.f,250.f};
+    const int by=80;
+    forwardBtn.setBounds(24,by,80,26);
+    reverseBtn.setBounds(108,by,80,26);
+    customBtn.setBounds(192,by,80,26);
 
-    patternGraphArea = patternArea.withTrimmedTop(48.f).withTrimmedBottom(38.f).reduced(16.f,0.f);
-    volumePlotArea = volumeArea.withTrimmedTop(50.f).withTrimmedBottom(46.f).reduced(36.f,0.f);
+    int mx=300;
+    volumeModeBtn.setBounds(mx,by,68,26); mx+=72;
+    panModeBtn.setBounds(mx,by,60,26); mx+=64;
+    pitchModeBtn.setBounds(mx,by,60,26); mx+=64;
+    formantModeBtn.setBounds(mx,by,76,26); mx+=80;
+    reverseModeBtn.setBounds(mx,by,76,26);
 
-    forwardBtn.setBounds((int)patternArea.getRight()-192,(int)patternArea.getY()+10,90,24);
-    reverseBtn.setBounds((int)patternArea.getRight()-98,(int)patternArea.getY()+10,90,24);
+    snapBtn.setBounds(w-24-64,by,64,26);
 
-    const int curveBtnW=78;
-    curve1Btn.setBounds((int)volumeArea.getRight()-(curveBtnW*3+8),(int)volumeArea.getY()+10,curveBtnW,24);
-    curve2Btn.setBounds((int)volumeArea.getRight()-(curveBtnW*2+4),(int)volumeArea.getY()+10,curveBtnW,24);
-    curve3Btn.setBounds((int)volumeArea.getRight()-curveBtnW,(int)volumeArea.getY()+10,curveBtnW,24);
+    editorPanelArea = {24.f,120.f,(float)w-48.f,(float)h-120.f-40.f};
+    graphArea = editorPanelArea.reduced(40.f,44.f).withTrimmedBottom(20.f);
 }
