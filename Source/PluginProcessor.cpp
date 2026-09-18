@@ -52,21 +52,19 @@ void PDAudioProcessor::prepareToPlay(double sampleRate,int){
     samplePosition=0;
 }
 
-// FIX (requested): after listening, the hand-extracted pattern didn't sound good and the clean
-// exponential-deceleration pattern did - so for now there is only ONE real pattern (this one),
-// occupying every slot, until the redesigned preset panel replaces this whole mechanism.
+// FIX (requested): the tail's last 6 points are now the EXACT positions read directly from the
+// reference Cubase project's MIDI notes (bar.beat.16th.tick, confirmed via screenshot, converted at
+// 480 ticks/quarter, 4/4): 26.2.4.96, 26.3.2.1, 26.3.3.46, 26.3.4.113, 26.4.2.87, 26.4.4.87 -> as
+// fractions of the measure: 0.4875, 0.5630, 0.6490, 0.7464, 0.8578, 0.9828. This replaces an earlier
+// estimate (extended from a smooth formula, then a separate mp3-based automated peak-detection guess)
+// with ground truth - no more guessing at this part of the pattern. Notably the reference's last note
+// lands at 98.3% of the measure (~34ms of trailing space at 120 BPM) - much closer to the boundary
+// than an earlier mp3-based estimate suggested, which was very likely a peak-detection undercount.
 static PDAudioProcessor::Pattern buildForwardPattern(){
     PDAudioProcessor::Pattern pat{};
-    // FIX (requested - simplified per feedback): the previous tail invented a tight 6-point "flourish
-    // cluster" (0.760-0.892) meant to mirror what automated peak-detection found in the reference
-    // audio - but that detection likely picked up resonance/ringing as if they were separate onsets,
-    // which a human ear correctly ignores. The actual, simpler complaint was just about the LAST
-    // THREE hits not landing well. This tail now does one thing: continues the SAME smooth,
-    // ever-increasing-gap curve the rest of the pattern already follows, for three more points, and
-    // stops with clear trailing space (86% of the measure) - no invented cluster, no special-casing.
     float p0[]={0.000f,0.007f,0.015f,0.024f,0.034f,0.047f,0.061f,0.078f,0.098f,0.121f,0.147f,0.178f,
-                0.214f,0.256f,0.305f,0.362f,0.429f,0.506f,0.596f,0.701f,
-                0.760f,0.815f,0.860f};
+                0.214f,0.256f,0.305f,0.362f,0.429f,
+                0.4875f,0.5630f,0.6490f,0.7464f,0.8578f,0.9828f};
     pat.count=(int)(sizeof(p0)/sizeof(p0[0]));
     for(int i=0;i<pat.count;++i) pat.positions[i]=p0[i];
     return pat;
