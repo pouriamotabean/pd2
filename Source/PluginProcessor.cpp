@@ -79,11 +79,16 @@ static PDAudioProcessor::Pattern buildReversePattern(){
     const auto& fwd=buildForwardPattern();
     PDAudioProcessor::Pattern pat{};
     pat.count=fwd.count;
+    // FIX (real bug found after tightening Forward's early gaps): a flat jmin(mirrored,0.985f) clamp
+    // used to collapse the last 3 points to the exact same value (0.985) - Forward's first few points
+    // are now extremely close together (0.000/0.007/0.015), so their mirror images (1.000/0.993/0.985)
+    // all landed AT OR PAST the 0.985 ceiling and got flattened onto it, producing three simultaneous
+    // taps instead of three closely-spaced ones. Scaling the whole set by 0.985 instead preserves
+    // every point's relative spacing - nothing collapses, the closing space before the next measure
+    // just becomes a hair smaller across the board.
     for(int i=0;i<fwd.count;++i){
         float mirrored=1.0f-fwd.positions[fwd.count-1-i];
-        // Safety margin identical in spirit to Forward's own - never land exactly ON the next
-        // measure's first tap (fraction 0.0), which would double-trigger at the same instant.
-        pat.positions[i]=juce::jmin(mirrored,0.985f);
+        pat.positions[i]=mirrored*0.985f;
     }
     return pat;
 }
