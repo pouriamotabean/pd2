@@ -59,7 +59,7 @@ public:
         int id=0;
         float position=0.f;          // fraction of one measure, 0..1 - X axis, ALWAYS time (spec #3/#25)
         float volumeDb=0.f;          // -12..+12 - Phase 1 (VOLUME edit mode)
-        float pan=0.f;                // -1(L)..+1(R) - wired in Phase 2
+        float pan=0.f;                // -1(L)..+1(R) - wired in Phase 2 (PAN edit mode)
         float pitchSemitones=0.f;     // -12..+12 - wired in Phase 3 (Phase Vocoder engine)
         float formantSemitones=0.f;   // -12..+12 - wired in Phase 4
         bool reverse=false;           // wired in Phase 5
@@ -68,23 +68,29 @@ public:
     static constexpr int kMaxRepeats=64;
     struct RepeatPattern { int count=0; RepeatEvent events[kMaxRepeats]{}; };
 
-    // Forward/Reverse: the exact same shapes PD already had, re-expressed as RepeatEvents (position +
-    // volumeDb=0, since the old volume curve's factory default was already flat) - locked, not
-    // user-editable, per the explicit request to preserve them "in their current form".
-    static const RepeatPattern& getLockedPreset(int index); // index 0=Forward, 1=Reverse
-
-    // Custom: the user's own editable pattern. Lock-free double-buffer exchange (spec section 23) -
-    // the UI writes a COMPLETE new pattern into whichever buffer is currently INACTIVE, then flips an
+    // FIX (requested): Forward and Reverse are no longer fully immutable. Their POSITIONS stay fixed
+    // (that's a UI-level editing policy - the editor simply never lets a drag/create/delete gesture
+    // touch position for these two presets - not a data-model restriction), but volumeDb (and, as
+    // later phases land, pan/pitch/formant) are genuinely editable and saved with the project, exactly
+    // like Custom. All three presets are therefore just three named, independently-editable
+    // RepeatPatterns now - Forward/Reverse simply start from the tuned rhythmic shape instead of
+    // starting empty, and the editor prevents repositioning/adding/removing repeats on them.
+    //
+    // Lock-free double-buffer exchange (spec section 23), one pair per preset - the UI writes a
+    // COMPLETE new pattern into whichever buffer is currently INACTIVE for that preset, then flips an
     // atomic index; the audio thread only ever reads whichever buffer is currently active, and that
     // buffer is never mutated again until it becomes inactive - so there is no torn-read window and no
     // lock is ever taken on the audio thread.
-    RepeatPattern getCustomPatternForEditing() const; // UI thread - a working copy to edit and hand back
-    void commitCustomPattern(const RepeatPattern& newPattern); // UI thread - publishes an edited copy
+    RepeatPattern getPatternForEditing(int presetIndex) const; // UI thread - a working copy to edit and hand back
+    void commitPattern(int presetIndex, const RepeatPattern& newPattern); // UI thread - publishes an edited copy
     const RepeatPattern& getActivePatternForAudio(int presetIndex) const; // safe from either thread
 
 private:
-    std::array<RepeatPattern,2> customBuffers{};
-    std::atomic<int> customActiveBuffer{0};
+    // buffers[presetIndex][0 or 1]; active[presetIndex] says which of the pair is currently live.
+    std::array<std::array<RepeatPattern,2>,3> presetBuffers{};
+    std::array<std::atomic<int>,3> presetActiveBuffer{};
+    static RepeatPattern buildForwardSeed(); // the tuned shape Forward/Reverse start from - see .cpp
+    static RepeatPattern buildReverseSeed();
 
     double sr = 44100.0;
 
@@ -99,12 +105,12 @@ private:
     int grainWritePos = 0;
     bool grainArmed = false;
 
-    struct PendingTap { juce::int64 startSample; float gain; juce::int64 triggerSample; juce::int64 maxLenSamples; };
+    struct PendingTap { juce::int64 startSample; float gain; float pan; juce::int64 triggerSample; juce::int64 maxLenSamples; };
     // A new trigger force-fades (not hard-clears) whatever was still playing from the previous note -
     // see scheduleTapsForTrigger()/processBlock() - avoiding an audible click on fast/overlapping notes.
     static constexpr int kForceFadeSamples = 256; // ~5.8ms @44.1kHz - short but click-free
     struct ActiveTap {
-        int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f;
+        int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f; float pan=0.f;
         bool forced=false; int forcedTotal=0;
         std::array<float,kForceFadeSamples> tailL{}, tailR{}; // only used once forced==true
     };

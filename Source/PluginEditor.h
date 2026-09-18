@@ -12,11 +12,11 @@ public:
                          bool shouldDrawButtonAsHighlighted, bool shouldDrawButtonAsDown) override;
 };
 
-// PD - Phase 1 of the Interactive Repeat Pattern Editor rewrite. The Pattern Editor is now the
+// PD - Phase 2 of the Interactive Repeat Pattern Editor rewrite. The Pattern Editor is now the
 // primary control surface (spec section 20): click-drag in empty space creates a repeat, dragging a
 // repeat's body moves it in time, dragging its top handle edits the value the current EDIT MODE
-// represents (Phase 1: VOLUME only - PAN/PITCH/FORMANT are visible as mode buttons but disabled until
-// their phases land, per the phased build plan). REVERSE mode's toggle-per-repeat also lands later.
+// represents (VOLUME and PAN are wired up - PITCH/FORMANT are visible as mode buttons but disabled
+// until their phases land, per the phased build plan). REVERSE mode's toggle-per-repeat lands later.
 class PDAudioProcessorEditor : public juce::AudioProcessorEditor, private juce::Timer {
 public:
     explicit PDAudioProcessorEditor(PDAudioProcessor&);
@@ -38,10 +38,10 @@ private:
     juce::Rectangle<float> headerArea, editorPanelArea, graphArea;
 
     // ---- Editing state (spec sections 9/10/12/22) ----
-    // FIX (spec #23 - thread safety): workingPattern is the UI's own editable copy. Every mutation is
-    // followed by p.commitCustomPattern(workingPattern), which lock-free-publishes it to the audio
-    // thread (see PDAudioProcessor::commitCustomPattern). The UI never reaches into the processor's
-    // internal buffers directly.
+    // FIX (spec #23 - thread safety): workingPattern is the UI's own editable copy of whichever preset
+    // is currently selected. Every mutation is followed by p.commitPattern(...), which lock-free-
+    // publishes it to the audio thread (see PDAudioProcessor::commitPattern). The UI never reaches
+    // into the processor's internal buffers directly.
     PDAudioProcessor::RepeatPattern workingPattern;
     int selectedEventIndex=-1;
     int hoveredEventIndex=-1;
@@ -49,15 +49,26 @@ private:
     DragMode dragMode=DragMode::None;
     int draggedEventIndex=-1;
 
-    bool isCustomPresetActive() const;
+    // FIX (Phase 2): the vertical axis now represents whichever EDIT MODE is selected (spec #25) -
+    // VOLUME or PAN so far. Adding a mode is: one entry in EditMode, one branch in getEditValue/
+    // setEditValue/editValueRange, and a button - the drag/hit-test/paint code is entirely generic
+    // and doesn't change per mode.
+    enum class EditMode { Volume, Pan };
+    EditMode currentEditMode=EditMode::Volume;
+    float getEditValue(const PDAudioProcessor::RepeatEvent&) const;      // reads the field the current mode represents, in DISPLAY units
+    void setEditValue(PDAudioProcessor::RepeatEvent&, float displayValue) const; // writes it back, clamped to that mode's range
+    float editValueRangeMax() const; // 12 for dB, 100 for pan - the +/- range of the current mode
+
+    bool isCustomPresetActive() const; // Custom only: position can be moved, repeats can be added/removed
+    int currentPresetIndex() const;    // 0=Forward, 1=Reverse, 2=Custom - value editing works on all three
     void refreshWorkingPatternFromProcessor();
     void commitWorkingPattern();
 
-    // Geometry <-> value mapping for the current edit mode (Phase 1: VOLUME only)
+    // Geometry <-> value mapping - X is always time; Y is whatever the current edit mode represents.
     float xToPosition(float x) const;
     float positionToX(float position) const;
-    float yToVolumeDb(float y) const;
-    float volumeDbToY(float db) const;
+    float yToEditValue(float y) const;
+    float editValueToY(float displayValue) const;
     juce::Point<float> eventHandlePoint(const PDAudioProcessor::RepeatEvent&) const;
 
     // Hit testing, in the priority order the spec requires (section 10/22):
@@ -67,15 +78,17 @@ private:
 
     bool snapEnabled=true;
     float snappedPosition(float rawPosition) const;
+    float snappedEditValue(float displayValue) const; // FIX (Phase 2): grid/free now applies to the value axis too, not just time
 
     juce::TextButton bypassBtn{"BYPASS"};
     juce::TextButton forwardBtn{"FORWARD"}, reverseBtn{"REVERSE"}, customBtn{"CUSTOM"};
     void updatePresetButtonStates();
 
-    // Edit-mode buttons (spec section 2). Only VOLUME is functional in Phase 1 - the other four are
-    // visible (so the final layout is already in place) but disabled until their phases land.
+    // Edit-mode buttons (spec section 2). VOLUME and PAN are functional (Phase 1/2) - the remaining
+    // three are visible (so the final layout is already in place) but disabled until their phases land.
     juce::TextButton volumeModeBtn{"VOLUME"}, panModeBtn{"PAN"}, pitchModeBtn{"PITCH"},
                      formantModeBtn{"FORMANT"}, reverseModeBtn{"REVERSE"};
+    void updateModeButtonStates();
     juce::TextButton snapBtn{"SNAP"};
 
     PDButtonLookAndFeel pdLnf;

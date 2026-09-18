@@ -8,9 +8,15 @@ PDAudioProcessor::PDAudioProcessor()
                                        .withOutput("Output",juce::AudioChannelSet::stereo(),true)),
       apvts(*this,nullptr,"PD_PARAMS",createParameterLayout())
 {
-    // customBuffers default-construct to count=0 (an empty pattern) - the spec's required "start from
-    // an empty pattern" state (section 15/26) is simply what a fresh instance already has, no special
-    // case needed.
+    // FIX (requested): Forward/Reverse now start from the tuned rhythmic shape (positions fixed by
+    // editor policy, values editable) instead of being fully immutable - both buffers of each pair
+    // are seeded identically so it doesn't matter which one starts "active". Custom's buffers are
+    // left at their default count=0 (an empty pattern) - the spec's required starting state.
+    const auto fwdSeed=buildForwardSeed();
+    const auto revSeed=buildReverseSeed();
+    presetBuffers[(size_t)kPresetForward][0]=fwdSeed; presetBuffers[(size_t)kPresetForward][1]=fwdSeed;
+    presetBuffers[(size_t)kPresetReverse][0]=revSeed; presetBuffers[(size_t)kPresetReverse][1]=revSeed;
+    for(auto& a:presetActiveBuffer) a.store(0);
 }
 
 PDAudioProcessor::~PDAudioProcessor(){}
@@ -18,9 +24,6 @@ PDAudioProcessor::~PDAudioProcessor(){}
 juce::AudioProcessorValueTreeState::ParameterLayout PDAudioProcessor::createParameterLayout(){
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
     ps.push_back(std::make_unique<juce::AudioParameterBool>(pBypass,"Bypass",false));
-    // FIX (Phase 1 of the interactive-editor rewrite): this parameter now selects between the two
-    // LOCKED shapes PD already had (Forward/Reverse, kept exactly "in their current form" per the
-    // explicit request) and the new fully user-editable Custom pattern.
     ps.push_back(std::make_unique<juce::AudioParameterChoice>(pPreset,"Pattern",
         juce::StringArray{"Forward","Reverse","Custom"},0));
     ps.push_back(std::make_unique<juce::AudioParameterFloat>(pGrainMs,"Grain Length",
@@ -36,37 +39,34 @@ bool PDAudioProcessor::isBusesLayoutSupported(const BusesLayout& layouts) const 
 void PDAudioProcessor::prepareToPlay(double sampleRate,int){
     sr=sampleRate;
     envFast=0.f; envSlow=0.f; samplesSinceLastTrigger=1LL<<40;
-    grainBufferCapacitySamples=(int)std::round(sr*8.0); // 8s - generous headroom over any realistic measure length
+    grainBufferCapacitySamples=(int)std::round(sr*8.0);
     grainBuffer.setSize(2,grainBufferCapacitySamples); grainBuffer.clear();
     grainWritePos=0; grainArmed=false;
     pendingTaps.clear(); activeTaps.clear();
     samplePosition=0;
 }
 
-// FIX (Phase 1): Forward/Reverse re-expressed as RepeatEvents instead of a bare position array - same
-// exact positions PD already had (ground-truth values from the reference Cubase project's MIDI, see
-// earlier session), volumeDb=0 for every event (the old volume curve's factory default was already
-// flat, so this is not a behaviour change, just the same flat shape now living on each event instead
-// of a separate curve object). "Magic statics" (a static local with a real initializer) guarantees
-// this builds exactly once, thread-safe, with no manual flag/lock needed.
-static PDAudioProcessor::RepeatPattern buildForwardLockedPreset(){
-    PDAudioProcessor::RepeatPattern pat{};
+// Ground-truth positions from the reference project's MIDI (bar.beat.16th.tick, confirmed via
+// screenshot). This is now just the SEED that Forward starts from - the editor lets its volumeDb (and
+// later pan/pitch/formant) be adjusted afterward; only the positions stay fixed by editor policy.
+PDAudioProcessor::RepeatPattern PDAudioProcessor::buildForwardSeed(){
+    RepeatPattern pat{};
     float p0[]={0.000f,0.007f,0.015f,0.024f,0.034f,0.047f,0.061f,0.078f,0.098f,0.121f,0.147f,0.178f,
                 0.214f,0.256f,0.305f,0.362f,0.429f,
                 0.4875f,0.5630f,0.6490f,0.7464f,0.8578f,0.9828f};
     pat.count=(int)(sizeof(p0)/sizeof(p0[0]));
     for(int i=0;i<pat.count;++i){
         auto& e=pat.events[i];
-        e.id=i; e.position=p0[i]; e.volumeDb=0.f; e.pan=0.f;
-        e.pitchSemitones=0.f; e.formantSemitones=0.f; e.reverse=false; e.enabled=true;
+        e=RepeatEvent{}; // defaults (volumeDb=0 etc)
+        e.id=i; e.position=p0[i];
     }
     return pat;
 }
-// Reverse: the exact mirror of Forward (reflected around the centre of the measure, order reversed),
-// same as before - computed FROM Forward so the two never silently drift apart.
-static PDAudioProcessor::RepeatPattern buildReverseLockedPreset(){
-    const auto fwd=buildForwardLockedPreset();
-    PDAudioProcessor::RepeatPattern pat{};
+// Reverse: the exact mirror of Forward (reflected around the centre of the measure, order reversed) -
+// computed FROM Forward so the two never silently drift apart.
+PDAudioProcessor::RepeatPattern PDAudioProcessor::buildReverseSeed(){
+    const auto fwd=buildForwardSeed();
+    RepeatPattern pat{};
     pat.count=fwd.count;
     for(int i=0;i<fwd.count;++i){
         auto& e=pat.events[i];
@@ -76,35 +76,26 @@ static PDAudioProcessor::RepeatPattern buildReverseLockedPreset(){
     }
     return pat;
 }
-const PDAudioProcessor::RepeatPattern& PDAudioProcessor::getLockedPreset(int index){
-    static const RepeatPattern forward = buildForwardLockedPreset();
-    static const RepeatPattern reverse = buildReverseLockedPreset();
-    return (juce::jlimit(0,1,index)==0) ? forward : reverse;
-}
 
-// ---- Custom pattern: lock-free double-buffer exchange (spec section 23) ----
-PDAudioProcessor::RepeatPattern PDAudioProcessor::getCustomPatternForEditing() const {
-    return customBuffers[(size_t)customActiveBuffer.load()]; // small POD - cheap to copy on the UI thread
+// ---- Per-preset lock-free double-buffer exchange (spec section 23) ----
+PDAudioProcessor::RepeatPattern PDAudioProcessor::getPatternForEditing(int presetIndex) const {
+    int idx=juce::jlimit(0,2,presetIndex);
+    return presetBuffers[(size_t)idx][(size_t)presetActiveBuffer[(size_t)idx].load()];
 }
-void PDAudioProcessor::commitCustomPattern(const RepeatPattern& newPattern){
-    int activeIdx=customActiveBuffer.load();
+void PDAudioProcessor::commitPattern(int presetIndex, const RepeatPattern& newPattern){
+    int idx=juce::jlimit(0,2,presetIndex);
+    int activeIdx=presetActiveBuffer[(size_t)idx].load();
     int writeIdx=1-activeIdx;
-    customBuffers[(size_t)writeIdx]=newPattern; // fully write the INACTIVE buffer first...
-    customActiveBuffer.store(writeIdx);         // ...then atomically publish it. The audio thread
-    // never sees a half-written pattern: it only ever reads customBuffers[customActiveBuffer.load()],
-    // and that index only changes to a buffer that is already completely written.
+    presetBuffers[(size_t)idx][(size_t)writeIdx]=newPattern; // fully write the INACTIVE buffer first...
+    presetActiveBuffer[(size_t)idx].store(writeIdx);         // ...then atomically publish it.
 }
 const PDAudioProcessor::RepeatPattern& PDAudioProcessor::getActivePatternForAudio(int presetIndex) const {
-    if(presetIndex==kPresetCustom) return customBuffers[(size_t)customActiveBuffer.load()];
-    return getLockedPreset(presetIndex==kPresetReverse ? 1 : 0);
+    int idx=juce::jlimit(0,2,presetIndex);
+    return presetBuffers[(size_t)idx][(size_t)presetActiveBuffer[(size_t)idx].load()];
 }
 
 void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
     pendingTaps.clear();
-    // Don't hard-clear active taps - snapshot each one's next few milliseconds of audio out of the
-    // CURRENT grain buffer (about to be reused for this new note) into its own private tail, and
-    // switch it into a forced linear fade-to-zero, so an interrupted tap fades quickly instead of
-    // clicking.
     for(auto& tap:activeTaps){
         if(tap.forced) continue;
         tap.forced=true;
@@ -124,27 +115,21 @@ void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
     double measureSec = (60.0/juce::jmax(1.0,bpm)) * juce::jmax(1,num);
     juce::int64 measureSamples=(juce::int64)std::round(measureSec*sr);
 
-    // FIX (Phase 1 - unified data model): gain now comes from each RepeatEvent's own volumeDb field
-    // instead of a separate volume-curve lookup - the "one real data object per repeat" the spec
-    // requires. Events are sorted by position before scheduling (the editor doesn't guarantee storage
-    // order), and disabled events are skipped entirely.
-    struct Sortable { float position; float gain; };
+    struct Sortable { float position; float gain; float pan; };
     std::vector<Sortable> sorted;
     sorted.reserve((size_t)pat.count);
     for(int i=0;i<pat.count;++i){
         const auto& e=pat.events[i];
         if(!e.enabled) continue;
         float gain=juce::Decibels::decibelsToGain(juce::jlimit(-12.f,12.f,e.volumeDb));
-        sorted.push_back({juce::jlimit(0.f,1.f,e.position),gain});
+        sorted.push_back({juce::jlimit(0.f,1.f,e.position),gain,juce::jlimit(-1.f,1.f,e.pan)});
     }
     std::sort(sorted.begin(),sorted.end(),[](const Sortable&a,const Sortable&b){return a.position<b.position;});
 
     for(auto& s:sorted){
         juce::int64 off=(juce::int64)std::round((double)s.position*(double)measureSamples);
-        pendingTaps.push_back({triggerSample+off,s.gain,triggerSample,0});
+        pendingTaps.push_back({triggerSample+off,s.gain,s.pan,triggerSample,0});
     }
-    // Each tap's playback is capped by the gap to the NEXT scheduled tap (not just the Grain Length
-    // parameter), so closely-spaced repeats never overlap-blur into a smeared burst.
     for(size_t i=0;i<pendingTaps.size();++i){
         if(i+1<pendingTaps.size()){
             juce::int64 gap=pendingTaps[i+1].startSample-pendingTaps[i].startSample;
@@ -159,7 +144,7 @@ void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
 void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer&){
     juce::ScopedNoDenormals noDenormals;
     const int n=b.getNumSamples(); const int ch=juce::jmin(2,b.getNumChannels());
-    if(ch<2){ samplePosition+=n; return; } // mono-in not supported by this effect's stereo grain design
+    if(ch<2){ samplePosition+=n; return; }
 
     if(auto* ph=getPlayHead()){
         if(auto pos=ph->getPosition()){
@@ -199,21 +184,29 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                 int availableSoFar=(int)(absSample-pendingTaps[t].triggerSample);
                 juce::int64 cap64=juce::jmin((juce::int64)desiredGrainSamples,pendingTaps[t].maxLenSamples);
                 int len=juce::jlimit(0,(int)cap64,availableSoFar);
-                if(len>0) activeTaps.push_back({0,len,len,pendingTaps[t].gain});
+                if(len>0) activeTaps.push_back({0,len,len,pendingTaps[t].gain,pendingTaps[t].pan});
                 pendingTaps.erase(pendingTaps.begin()+(long)t);
             } else ++t;
         }
 
-        float outL=L, outR=R; // dry, always untouched up to this point
+        float outL=L, outR=R;
 
         for(size_t t=0;t<activeTaps.size();){
             auto& tap=activeTaps[t];
+            // FIX (Phase 2 - PAN mode wired to DSP): a simple balance law - panning right fades this
+            // tap's contribution to the LEFT channel, panning left fades its contribution to the
+            // RIGHT channel, centre (0) leaves both at full gain. Deliberately simple/predictable
+            // rather than equal-power, since the grain itself is already a real stereo capture (not a
+            // mono source being spread into stereo) - this reads as "balance the repeat" rather than
+            // introducing a new stereo image from scratch.
+            const float panGainL = tap.pan<=0.f ? 1.f : 1.f-tap.pan;
+            const float panGainR = tap.pan>=0.f ? 1.f : 1.f+tap.pan;
             if(tap.forced){
                 if(tap.samplesRemaining>0){
                     int posIntoTap=tap.forcedTotal-tap.samplesRemaining;
                     float ramp = tap.forcedTotal>0 ? 1.f-(float)posIntoTap/(float)tap.forcedTotal : 0.f;
-                    outL += tap.tailL[(size_t)tap.grainReadPos]*tap.gain*ramp;
-                    outR += tap.tailR[(size_t)tap.grainReadPos]*tap.gain*ramp;
+                    outL += tap.tailL[(size_t)tap.grainReadPos]*tap.gain*ramp*panGainL;
+                    outR += tap.tailR[(size_t)tap.grainReadPos]*tap.gain*ramp*panGainR;
                     ++tap.grainReadPos; --tap.samplesRemaining;
                 }
                 if(tap.samplesRemaining<=0) activeTaps.erase(activeTaps.begin()+(long)t); else ++t;
@@ -228,7 +221,7 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                     else if(tap.samplesRemaining<=fadeLen) fade=0.5f-0.5f*std::cos(juce::MathConstants<float>::pi*(float)tap.samplesRemaining/(float)fadeLen);
                 }
                 float gL=grainBuffer.getSample(0,tap.grainReadPos), gR=grainBuffer.getSample(1,tap.grainReadPos);
-                outL += gL*tap.gain*fade; outR += gR*tap.gain*fade;
+                outL += gL*tap.gain*fade*panGainL; outR += gR*tap.gain*fade*panGainR;
                 ++tap.grainReadPos; --tap.samplesRemaining;
             }
             if(tap.samplesRemaining<=0) activeTaps.erase(activeTaps.begin()+(long)t); else ++t;
@@ -243,16 +236,19 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
 
 juce::AudioProcessorEditor* PDAudioProcessor::createEditor(){ return new PDAudioProcessorEditor(*this); }
 
-// FIX (Phase 1 - spec section 24, DAW state): the Custom pattern must survive project save/reload.
-// Serialized as a simple length-prefixed block of RepeatEvents, base64'd into the same APVTS
-// ValueTree the rest of the state already uses - no separate save mechanism to keep in sync.
+// FIX (requested): all THREE patterns (Forward/Reverse/Custom) now have editable values that must
+// survive project save/reload, not just Custom - each serialized as a simple length-prefixed block of
+// RepeatEvents, base64'd into the same APVTS ValueTree the rest of the state already uses.
 void PDAudioProcessor::getStateInformation(juce::MemoryBlock& destData){
     auto state=apvts.copyState();
-    auto custom=getCustomPatternForEditing();
-    juce::MemoryBlock patternBlock;
-    patternBlock.append(&custom.count,sizeof(int));
-    patternBlock.append(custom.events,sizeof(RepeatEvent)*kMaxRepeats);
-    state.setProperty("customPatternData",patternBlock.toBase64Encoding(),nullptr);
+    static const char* keys[3]={"forwardPatternData","reversePatternData","customPatternData"};
+    for(int p=0;p<3;++p){
+        auto pat=getPatternForEditing(p);
+        juce::MemoryBlock block;
+        block.append(&pat.count,sizeof(int));
+        block.append(pat.events,sizeof(RepeatEvent)*kMaxRepeats);
+        state.setProperty(keys[p],block.toBase64Encoding(),nullptr);
+    }
     std::unique_ptr<juce::XmlElement> xml(state.createXml());
     copyXmlToBinary(*xml,destData);
 }
@@ -262,20 +258,26 @@ void PDAudioProcessor::setStateInformation(const void* data,int sizeInBytes){
     auto tree=juce::ValueTree::fromXml(*xml);
     apvts.replaceState(tree);
 
-    RepeatPattern loaded{};
+    static const char* keys[3]={"forwardPatternData","reversePatternData","customPatternData"};
     const size_t expected=sizeof(int)+sizeof(RepeatEvent)*kMaxRepeats;
-    juce::MemoryBlock mb;
-    bool ok = tree.hasProperty("customPatternData")
-        && mb.fromBase64Encoding(tree["customPatternData"].toString())
-        && mb.getSize()>=expected;
-    if(ok){
-        int count=0; std::memcpy(&count,mb.getData(),sizeof(int));
-        loaded.count=juce::jlimit(0,kMaxRepeats,count);
-        std::memcpy(loaded.events,(const char*)mb.getData()+sizeof(int),sizeof(RepeatEvent)*kMaxRepeats);
+    for(int p=0;p<3;++p){
+        RepeatPattern loaded{};
+        juce::MemoryBlock mb;
+        bool ok = tree.hasProperty(keys[p])
+            && mb.fromBase64Encoding(tree[keys[p]].toString())
+            && mb.getSize()>=expected;
+        if(ok){
+            int count=0; std::memcpy(&count,mb.getData(),sizeof(int));
+            loaded.count=juce::jlimit(0,kMaxRepeats,count);
+            std::memcpy(loaded.events,(const char*)mb.getData()+sizeof(int),sizeof(RepeatEvent)*kMaxRepeats);
+        } else {
+            // Older save (pre-this-feature) or nothing built yet - fall back to the tuned seed for
+            // Forward/Reverse (never an empty pattern for those two), or a genuinely empty Custom.
+            if(p==(int)kPresetForward) loaded=buildForwardSeed();
+            else if(p==(int)kPresetReverse) loaded=buildReverseSeed();
+        }
+        commitPattern(p,loaded);
     }
-    // else: no saved custom pattern (older project, or nothing built yet) - loaded stays at count=0,
-    // a valid empty pattern (spec section 15's "Empty Pattern" state), not an error case.
-    commitCustomPattern(loaded);
 }
 
 juce::AudioProcessor* JUCE_CALLTYPE createPluginFilter(){ return new PDAudioProcessor(); }
