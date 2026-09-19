@@ -60,7 +60,7 @@ public:
         float position=0.f;          // fraction of one measure, 0..1 - X axis, ALWAYS time (spec #3/#25)
         float volumeDb=0.f;          // -12..+12 - Phase 1 (VOLUME edit mode)
         float pan=0.f;                // -1(L)..+1(R) - wired in Phase 2 (PAN edit mode)
-        float pitchSemitones=0.f;     // -12..+12 - wired in Phase 3 (Phase Vocoder engine)
+        float pitchSemitones=0.f;     // -12..+12 - wired in Phase 3 (PITCH edit mode, Phase Vocoder engine)
         float formantSemitones=0.f;   // -12..+12 - wired in Phase 4
         bool reverse=false;           // wired in Phase 5
         bool enabled=true;
@@ -105,7 +105,7 @@ private:
     int grainWritePos = 0;
     bool grainArmed = false;
 
-    struct PendingTap { juce::int64 startSample; float gain; float pan; juce::int64 triggerSample; juce::int64 maxLenSamples; };
+    struct PendingTap { juce::int64 startSample; float gain; float pan; float pitchSemitones; float formantSemitones; bool reverse; juce::int64 triggerSample; juce::int64 maxLenSamples; };
     // A new trigger force-fades (not hard-clears) whatever was still playing from the previous note -
     // see scheduleTapsForTrigger()/processBlock() - avoiding an audible click on fast/overlapping notes.
     static constexpr int kForceFadeSamples = 256; // ~5.8ms @44.1kHz - short but click-free
@@ -113,6 +113,13 @@ private:
         int grainReadPos=0; int samplesRemaining=0; int totalSamples=0; float gain=1.f; float pan=0.f;
         bool forced=false; int forcedTotal=0;
         std::array<float,kForceFadeSamples> tailL{}, tailR{}; // only used once forced==true
+        // FIX (Phase 3): pool slot indices into pitchPool below, one per channel, -1 = this tap needs
+        // no pitch shift (the common case - taps play the raw grain exactly as before, unchanged).
+        int pvL=-1, pvR=-1;
+        // FIX (Phase 5): when true, this tap reads its own captured grain window BACKWARDS (the most
+        // recently-captured sample first) - the whole segment stays inside what's already captured
+        // (see the mixing loop), so there's no synchronization concern versus the live capture point.
+        bool reverse=false;
     };
     std::vector<PendingTap> pendingTaps;
     std::vector<ActiveTap> activeTaps;
@@ -120,6 +127,46 @@ private:
 
     int grainLengthSamplesFor(float desiredMs) const { return (int)std::round(desiredMs*0.001*sr); }
     static constexpr int kFadeSamples = 48; // short raised-cosine in/out on every tap's OWN natural start/end
+
+    // FIX (Phase 3 - real pitch shifting, "Alter Boy" quality target): a proper phase-vocoder, adapted
+    // from the same design used (and bug-fixed) in the PV plugin - FFT analysis/resynthesis with
+    // phase-accumulation, not the crude dual-read-head delay-line trick used for PV's tiny +/-10 cent
+    // doubler shifts. A real windowed-FFT engine like this is what "not too basic, model it after
+    // Alter Boy" actually requires once the shift range goes up to a full +/-12 semitones.
+    //
+    // Window size is deliberately SMALL (512 samples, ~11.6ms @44.1kHz) rather than a more typical
+    // 2048 (~46ms) - a real, inherent tension worth being upfront about: PD's taps are often much
+    // shorter than a vocal phrase (the whole point of the pattern is dense, short repeats), and a
+    // phase vocoder's analysis window IS its latency - anything longer than a tap's own duration
+    // means the shifted output never really arrives before the tap ends. 512 is a compromise (lower
+    // frequency resolution than a "proper" vocal pitch-shifter would use, but low enough latency to
+    // actually fit inside most of this pattern's taps) - worth tuning by ear once this is testable.
+    // FIX (Phase 4 - formant, independent of pitch, "Alter Boy" model): a real formant shift has to
+    // reshape the SPECTRAL ENVELOPE (the broad resonance shape that gives a voice its timbre/size)
+    // separately from where the harmonic energy sits (which is what pitch-shift moves). The approach:
+    // (1) extract a smoothed magnitude envelope by averaging nearby bins - a lightweight, practical
+    // stand-in for full cepstral liftering that avoids an extra FFT round-trip per hop, (2) divide the
+    // real spectrum by that envelope to get the "excitation" (fine harmonic detail with the envelope
+    // flattened out), (3) resample the envelope along the frequency axis by the formant ratio, (4)
+    // multiply the excitation back by the WARPED envelope. This happens entirely on magnitude, before
+    // the existing pitch-bin-remap step - phase (which drives where pitch-shifted energy ends up)
+    // comes from the original analysis, completely untouched by any of this. Skipped entirely (zero
+    // extra cost) when formant is centred, so pure Phase 3 pitch-shifting is unaffected.
+    struct PitchVocoderEngine {
+        static constexpr int N=512, H=128; // 4x overlap
+        int pos=0; double pitchRatio=1.0; double formantRatio=1.0; bool inUse=false;
+        std::vector<float> inRing, outRing, window, fftIn, fftOut;
+        std::vector<double> prevPhase, sumPhase;
+        std::vector<float> magBuf, envBuf, excitBuf; // scratch, sized N/2+1 - persistent to avoid per-hop heap allocation
+        std::unique_ptr<juce::dsp::FFT> fft;
+        void prepare(); // allocates buffers - called once per slot in prepareToPlay()
+        void reset(double newPitchRatio, double newFormantRatio); // clears state - called on every checkout
+        float process(float x);
+    };
+    static constexpr int kPitchPoolSize=16; // up to 8 concurrent stereo pitch/formant-shifted taps
+    std::array<PitchVocoderEngine,kPitchPoolSize> pitchPool;
+    int checkoutPitchEngine(double pitchRatio, double formantRatio); // returns a free slot index, or -1 if the pool is full (caller falls back to unshifted playback rather than blocking/crashing)
+    void releasePitchEngine(int slot);
 
     void scheduleTapsForTrigger(juce::int64 triggerSample);
 

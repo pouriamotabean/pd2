@@ -1,4 +1,5 @@
 #include "PluginEditor.h"
+#include <cstring>
 
 // =====================================================================================
 // PDButtonLookAndFeel - premium button depth (unchanged from the graphics-upgrade pass)
@@ -56,7 +57,8 @@ PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProc
     setWantsKeyboardFocus(true);
 
     for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&customBtn,
-                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn}){
+                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn,
+                   &undoBtn,&redoBtn,&saveBtn,&loadBtn,&emptyBtn}){
         addAndMakeVisible(*btn);
         btn->setClickingTogglesState(true);
         btn->setLookAndFeel(&pdLnf);
@@ -68,25 +70,38 @@ PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProc
     };
 
     // Preset selector: Forward / Reverse (locked, unchanged shapes) / Custom (the new editable one)
-    forwardBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(0.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; };
-    reverseBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(1.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; };
-    customBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(2.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; };
+    forwardBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(0.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; updateUndoRedoButtonStates(); };
+    reverseBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(1.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; updateUndoRedoButtonStates(); };
+    customBtn.onClick=[this]{ if(auto* a=p.apvts.getParameter(PDAudioProcessor::pPreset)) a->setValueNotifyingHost(2.f/2.f); updatePresetButtonStates(); refreshWorkingPatternFromProcessor(); selectedEventIndex=-1; updateUndoRedoButtonStates(); };
     updatePresetButtonStates();
 
-    // Edit-mode buttons (spec section 2) - VOLUME and PAN are wired up (Phase 1/2). The remaining
-    // three are shown (so the final 5-button layout already exists) but disabled until their phases
-    // land, with a tooltip saying so rather than silently doing nothing.
+    // Edit-mode buttons (spec section 2) - VOLUME, PAN, PITCH, FORMANT and REVERSE are all wired up
+    // now (Phase 1-5) - the full 5-button layout is finally all functional.
     volumeModeBtn.onClick=[this]{ currentEditMode=EditMode::Volume; updateModeButtonStates(); repaint(); };
     panModeBtn.onClick=[this]{ currentEditMode=EditMode::Pan; updateModeButtonStates(); repaint(); };
+    pitchModeBtn.onClick=[this]{ currentEditMode=EditMode::Pitch; updateModeButtonStates(); repaint(); };
+    formantModeBtn.onClick=[this]{ currentEditMode=EditMode::Formant; updateModeButtonStates(); repaint(); };
+    reverseModeBtn.onClick=[this]{ currentEditMode=EditMode::Reverse; updateModeButtonStates(); repaint(); };
     updateModeButtonStates();
-    for(auto* btn:{&pitchModeBtn,&formantModeBtn,&reverseModeBtn}){
-        btn->setEnabled(false);
-        btn->setTooltip("Coming in a later phase - see the phased build plan.");
-    }
 
     snapBtn.setToggleState(snapEnabled,juce::dontSendNotification);
     snapBtn.setTooltip("Snap repeat position to the beat grid while dragging.");
     snapBtn.onClick=[this]{ snapEnabled=snapBtn.getToggleState(); };
+
+    // FIX (Phase 6): Undo/Redo, visible buttons (not just a hidden keyboard shortcut - Ctrl/Cmd+Z and
+    // Shift+Ctrl/Cmd+Z work too, see keyPressed()) so the capability is actually discoverable.
+    undoBtn.setClickingTogglesState(false); redoBtn.setClickingTogglesState(false);
+    undoBtn.onClick=[this]{ performUndo(); };
+    redoBtn.onClick=[this]{ performRedo(); };
+    updateUndoRedoButtonStates();
+
+    saveBtn.setClickingTogglesState(false); loadBtn.setClickingTogglesState(false); emptyBtn.setClickingTogglesState(false);
+    saveBtn.setTooltip("Save this pattern to a file, to reuse in other projects.");
+    loadBtn.setTooltip("Load a pattern from a file.");
+    emptyBtn.setTooltip("Custom: clear all repeats. Forward/Reverse: reset every repeat's values (position stays fixed).");
+    saveBtn.onClick=[this]{ doSavePattern(); };
+    loadBtn.onClick=[this]{ doLoadPattern(); };
+    emptyBtn.onClick=[this]{ doEmptyPattern(); };
 
     refreshWorkingPatternFromProcessor();
     startTimerHz(30);
@@ -94,7 +109,8 @@ PDAudioProcessorEditor::PDAudioProcessorEditor(PDAudioProcessor& proc):AudioProc
 PDAudioProcessorEditor::~PDAudioProcessorEditor(){
     stopTimer();
     for(auto* btn:{&bypassBtn,&forwardBtn,&reverseBtn,&customBtn,
-                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn})
+                   &volumeModeBtn,&panModeBtn,&pitchModeBtn,&formantModeBtn,&reverseModeBtn,&snapBtn,
+                   &undoBtn,&redoBtn,&saveBtn,&loadBtn,&emptyBtn})
         btn->setLookAndFeel(nullptr);
 }
 
@@ -120,6 +136,94 @@ void PDAudioProcessorEditor::updatePresetButtonStates(){
 void PDAudioProcessorEditor::updateModeButtonStates(){
     volumeModeBtn.setToggleState(currentEditMode==EditMode::Volume,juce::dontSendNotification);
     panModeBtn.setToggleState(currentEditMode==EditMode::Pan,juce::dontSendNotification);
+    pitchModeBtn.setToggleState(currentEditMode==EditMode::Pitch,juce::dontSendNotification);
+    formantModeBtn.setToggleState(currentEditMode==EditMode::Formant,juce::dontSendNotification);
+    reverseModeBtn.setToggleState(currentEditMode==EditMode::Reverse,juce::dontSendNotification);
+}
+
+// ---- Phase 6: undo/redo, per preset ----------------------------------------------------------
+void PDAudioProcessorEditor::pushUndoState(){
+    auto& stack=undoStacks[(size_t)currentPresetIndex()];
+    stack.push_back(workingPattern);
+    if((int)stack.size()>kMaxUndoDepth) stack.erase(stack.begin());
+    redoStacks[(size_t)currentPresetIndex()].clear(); // a new edit invalidates any redo history
+    updateUndoRedoButtonStates();
+}
+void PDAudioProcessorEditor::performUndo(){
+    auto& undo=undoStacks[(size_t)currentPresetIndex()];
+    auto& redo=redoStacks[(size_t)currentPresetIndex()];
+    if(undo.empty()) return;
+    redo.push_back(workingPattern);
+    workingPattern=undo.back(); undo.pop_back();
+    commitWorkingPattern();
+    selectedEventIndex=-1; draggedEventIndex=-1; dragMode=DragMode::None;
+    updateUndoRedoButtonStates();
+    repaint();
+}
+void PDAudioProcessorEditor::performRedo(){
+    auto& undo=undoStacks[(size_t)currentPresetIndex()];
+    auto& redo=redoStacks[(size_t)currentPresetIndex()];
+    if(redo.empty()) return;
+    undo.push_back(workingPattern);
+    workingPattern=redo.back(); redo.pop_back();
+    commitWorkingPattern();
+    selectedEventIndex=-1; draggedEventIndex=-1; dragMode=DragMode::None;
+    updateUndoRedoButtonStates();
+    repaint();
+}
+void PDAudioProcessorEditor::updateUndoRedoButtonStates(){
+    undoBtn.setEnabled(!undoStacks[(size_t)currentPresetIndex()].empty());
+    redoBtn.setEnabled(!redoStacks[(size_t)currentPresetIndex()].empty());
+}
+
+// ---- Phase 6: save/load/empty ------------------------------------------------------------------
+void PDAudioProcessorEditor::doSavePattern(){
+    refreshWorkingPatternFromProcessor();
+    activeFileChooser = std::make_unique<juce::FileChooser>("Save PD pattern...", juce::File(), "*.pdpattern");
+    auto flags = juce::FileBrowserComponent::saveMode | juce::FileBrowserComponent::canSelectFiles | juce::FileBrowserComponent::warnAboutOverwriting;
+    activeFileChooser->launchAsync(flags, [this](const juce::FileChooser& fc){
+        auto file=fc.getResult();
+        if(file==juce::File()) return; // user cancelled
+        juce::MemoryBlock block;
+        block.append(&workingPattern.count,sizeof(int));
+        block.append(workingPattern.events,sizeof(PDAudioProcessor::RepeatEvent)*PDAudioProcessor::kMaxRepeats);
+        file.replaceWithData(block.getData(),block.getSize());
+    });
+}
+void PDAudioProcessorEditor::doLoadPattern(){
+    activeFileChooser = std::make_unique<juce::FileChooser>("Load PD pattern...", juce::File(), "*.pdpattern");
+    auto flags = juce::FileBrowserComponent::openMode | juce::FileBrowserComponent::canSelectFiles;
+    activeFileChooser->launchAsync(flags, [this](const juce::FileChooser& fc){
+        auto file=fc.getResult();
+        if(file==juce::File()) return; // user cancelled
+        juce::MemoryBlock block;
+        const size_t expected=sizeof(int)+sizeof(PDAudioProcessor::RepeatEvent)*PDAudioProcessor::kMaxRepeats;
+        if(!file.loadFileAsData(block) || block.getSize()<expected) return; // corrupt/wrong file - ignore rather than crash
+        pushUndoState();
+        int count=0; std::memcpy(&count,block.getData(),sizeof(int));
+        workingPattern.count=juce::jlimit(0,PDAudioProcessor::kMaxRepeats,count);
+        std::memcpy(workingPattern.events,(const char*)block.getData()+sizeof(int),sizeof(PDAudioProcessor::RepeatEvent)*PDAudioProcessor::kMaxRepeats);
+        commitWorkingPattern();
+        selectedEventIndex=-1;
+        repaint();
+    });
+}
+void PDAudioProcessorEditor::doEmptyPattern(){
+    refreshWorkingPatternFromProcessor();
+    pushUndoState();
+    if(isCustomPresetActive()){
+        workingPattern.count=0; // Custom can be genuinely emptied - its repeats aren't fixed
+    } else {
+        // Forward/Reverse: positions are fixed by design - "empty" here means reset every repeat's
+        // editable VALUES back to neutral, not remove the repeats themselves.
+        for(int i=0;i<workingPattern.count;++i){
+            auto& e=workingPattern.events[i];
+            e.volumeDb=0.f; e.pan=0.f; e.pitchSemitones=0.f; e.formantSemitones=0.f; e.reverse=false;
+        }
+    }
+    commitWorkingPattern();
+    selectedEventIndex=-1;
+    repaint();
 }
 
 // ---- Edit-mode value access (spec section 2/25) --------------------------------------------
@@ -127,6 +231,12 @@ float PDAudioProcessorEditor::getEditValue(const PDAudioProcessor::RepeatEvent& 
     switch(currentEditMode){
         case EditMode::Volume: return e.volumeDb;
         case EditMode::Pan: return e.pan*100.f; // display in -100..+100, per spec section 5
+        case EditMode::Pitch: return e.pitchSemitones;
+        case EditMode::Formant: return e.formantSemitones;
+        // FIX (Phase 5): Reverse is a bool, not a continuous value - fixed heights just place the
+        // handle sensibly (top=reversed, bottom=normal); the actual state change happens via a single
+        // click in mouseDown, never by dragging to a Y position.
+        case EditMode::Reverse: return e.reverse ? 12.f : -12.f;
     }
     return 0.f;
 }
@@ -134,10 +244,20 @@ void PDAudioProcessorEditor::setEditValue(PDAudioProcessor::RepeatEvent& e, floa
     switch(currentEditMode){
         case EditMode::Volume: e.volumeDb=juce::jlimit(-12.f,12.f,displayValue); break;
         case EditMode::Pan: e.pan=juce::jlimit(-1.f,1.f,displayValue*0.01f); break;
+        case EditMode::Pitch: e.pitchSemitones=juce::jlimit(-12.f,12.f,displayValue); break;
+        case EditMode::Formant: e.formantSemitones=juce::jlimit(-12.f,12.f,displayValue); break;
+        case EditMode::Reverse: break; // never set via drag - see mouseDown's dedicated toggle handling
     }
 }
 float PDAudioProcessorEditor::editValueRangeMax() const {
-    return currentEditMode==EditMode::Volume ? 12.f : 100.f;
+    switch(currentEditMode){
+        case EditMode::Volume: return 12.f;
+        case EditMode::Pan: return 100.f;
+        case EditMode::Pitch: return 12.f;
+        case EditMode::Formant: return 12.f;
+        case EditMode::Reverse: return 12.f;
+    }
+    return 12.f;
 }
 
 // ---- Geometry <-> value mapping - X is always time; Y is whatever the edit mode represents ----
@@ -174,7 +294,7 @@ float PDAudioProcessorEditor::snappedEditValue(float displayValue) const {
     // FIX (requested - grid/free applies to values too, not just time): VOLUME snaps to whole dB
     // steps, PAN snaps to 10% steps (L100..C..R100 in tidy increments) - same SNAP toggle as position.
     if(!snapEnabled) return displayValue;
-    float step = currentEditMode==EditMode::Volume ? 1.0f : 10.0f;
+    float step = currentEditMode==EditMode::Pan ? 10.0f : 1.0f; // Volume: 1dB, Pitch: 1 semitone, Pan: 10%
     return std::round(displayValue/step)*step;
 }
 
@@ -205,15 +325,29 @@ void PDAudioProcessorEditor::mouseDown(const juce::MouseEvent& e){
     // editing) works on ALL THREE presets now - only body-drag (reposition) and empty-space creation
     // are Custom-only, since Forward/Reverse's positions are fixed by design.
     int h=hitTestHandle(e.position);
-    if(h>=0){ draggedEventIndex=h; dragMode=DragMode::Value; selectedEventIndex=h; repaint(); return; }
+    if(h>=0){
+        selectedEventIndex=h;
+        // FIX (Phase 5): Reverse is a single click-to-toggle, not a drag-to-a-value gesture - there's
+        // nothing meaningful to drag to, so the state just flips immediately and no drag begins.
+        if(currentEditMode==EditMode::Reverse){
+            pushUndoState();
+            workingPattern.events[h].reverse=!workingPattern.events[h].reverse;
+            commitWorkingPattern();
+            draggedEventIndex=-1; dragMode=DragMode::None;
+            repaint(); return;
+        }
+        pushUndoState(); // one undo step covers the WHOLE upcoming drag gesture, not each pixel of it
+        draggedEventIndex=h; dragMode=DragMode::Value; repaint(); return;
+    }
 
     if(!isCustomPresetActive()) return; // Forward/Reverse: no repositioning, no creating/removing repeats
 
     int bIdx=hitTestBody(e.position);
-    if(bIdx>=0){ draggedEventIndex=bIdx; dragMode=DragMode::Position; selectedEventIndex=bIdx; repaint(); return; }
+    if(bIdx>=0){ pushUndoState(); draggedEventIndex=bIdx; dragMode=DragMode::Position; selectedEventIndex=bIdx; repaint(); return; }
 
     // Empty space -> create a new Repeat (spec section 9) - Custom only
     if(workingPattern.count>=PDAudioProcessor::kMaxRepeats) return; // full - ignore rather than overflow
+    pushUndoState();
     int idx=workingPattern.count++;
     auto& ev=workingPattern.events[idx];
     ev=PDAudioProcessor::RepeatEvent{};
@@ -238,7 +372,7 @@ void PDAudioProcessorEditor::mouseUp(const juce::MouseEvent&){
 void PDAudioProcessorEditor::mouseMove(const juce::MouseEvent& e){
     int h=hitTestHandle(e.position); // value-edit handles are hoverable on all three presets now
     if(h!=hoveredEventIndex){ hoveredEventIndex=h; repaint(); }
-    if(h>=0) setMouseCursor(juce::MouseCursor::UpDownResizeCursor);
+    if(h>=0) setMouseCursor(currentEditMode==EditMode::Reverse ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::UpDownResizeCursor);
     else if(!isCustomPresetActive()) setMouseCursor(juce::MouseCursor::NormalCursor);
     else if(hitTestBody(e.position)>=0) setMouseCursor(juce::MouseCursor::DraggingHandCursor);
     else if(graphArea.contains(e.position)) setMouseCursor(juce::MouseCursor::CrosshairCursor);
@@ -248,8 +382,12 @@ void PDAudioProcessorEditor::mouseExit(const juce::MouseEvent&){
     if(hoveredEventIndex!=-1){ hoveredEventIndex=-1; repaint(); }
 }
 bool PDAudioProcessorEditor::keyPressed(const juce::KeyPress& k){
+    // FIX (Phase 6): standard Undo/Redo shortcuts, in addition to the visible UNDO/REDO buttons.
+    if(k==juce::KeyPress('z',juce::ModifierKeys::commandModifier,0)){ performUndo(); return true; }
+    if(k==juce::KeyPress('z',juce::ModifierKeys::commandModifier|juce::ModifierKeys::shiftModifier,0)){ performRedo(); return true; }
     if((k==juce::KeyPress::deleteKey || k==juce::KeyPress::backspaceKey)
         && isCustomPresetActive() && selectedEventIndex>=0 && selectedEventIndex<workingPattern.count){
+        pushUndoState();
         for(int i=selectedEventIndex;i<workingPattern.count-1;++i) workingPattern.events[i]=workingPattern.events[i+1];
         --workingPattern.count;
         selectedEventIndex=-1; draggedEventIndex=-1; dragMode=DragMode::None;
@@ -311,7 +449,7 @@ void PDAudioProcessorEditor::drawEditorPanel(juce::Graphics& g) const {
     const auto& displayPattern = workingPattern;
 
     g.setColour(secondaryText()); g.setFont(juce::FontOptions(11.5f).withStyle("bold"));
-    juce::String modeName = currentEditMode==EditMode::Volume ? "VOLUME" : "PAN";
+    juce::String modeName = currentEditMode==EditMode::Volume ? "VOLUME" : (currentEditMode==EditMode::Pan ? "PAN" : (currentEditMode==EditMode::Pitch ? "PITCH" : (currentEditMode==EditMode::Formant ? "FORMANT" : "REVERSE")));
     g.drawText(modeName,editorPanelArea.getX()+16.f,editorPanelArea.getY()+8.f,160.f,16.f,juce::Justification::left);
     g.setColour(muted()); g.setFont(juce::FontOptions(9.5f));
     juce::String meta = juce::String(displayPattern.count)+(displayPattern.count==1?" REPEAT":" REPEATS")+"  \u2022  1 BAR";
@@ -331,18 +469,10 @@ void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
     g.setColour(secondaryBg()); g.fillRoundedRectangle(graphArea,7.f);
     g.setColour(border().withAlpha(0.6f)); g.drawRoundedRectangle(graphArea,7.f,1.0f);
 
-    // Reference gridlines - dB scale in Volume mode, L/C/R pan scale in Pan mode (spec section 5:
-    // "visual labels should clearly communicate L100 / CENTER / R100").
-    if(currentEditMode==EditMode::Volume){
-        for(float v : {-12.f,-6.f,0.f,6.f,12.f}){
-            float y=editValueToY(v);
-            g.setColour(border().withAlpha(v==0.f?0.5f:0.18f));
-            g.drawLine(graphArea.getX(),y,graphArea.getRight(),y,v==0.f?1.3f:1.0f);
-            g.setColour(muted().withAlpha(0.8f)); g.setFont(juce::FontOptions(8.5f));
-            juce::String lbl = (v==0.f?"0":(v>0?"+":"")+juce::String((int)v));
-            g.drawText(lbl,graphArea.getX()-26.f,y-6.f,22.f,12.f,juce::Justification::right);
-        }
-    } else {
+    // Reference gridlines - dB scale in Volume mode, L/C/R pan scale in Pan mode, semitone scale in
+    // Pitch/Formant mode, FWD/REV in Reverse mode (spec section 5: "visual labels should clearly
+    // communicate" the current mode's units).
+    if(currentEditMode==EditMode::Pan){
         for(float v : {-100.f,-50.f,0.f,50.f,100.f}){
             float y=editValueToY(v);
             g.setColour(border().withAlpha(v==0.f?0.5f:0.18f));
@@ -350,6 +480,26 @@ void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
             g.setColour(muted().withAlpha(0.8f)); g.setFont(juce::FontOptions(8.5f));
             juce::String lbl = v==0.f?"C":(v<0.f?("L"+juce::String((int)-v)):("R"+juce::String((int)v)));
             g.drawText(lbl,graphArea.getX()-28.f,y-6.f,24.f,12.f,juce::Justification::right);
+        }
+    } else if(currentEditMode==EditMode::Reverse){
+        for(float v : {-12.f,12.f}){
+            float y=editValueToY(v);
+            g.setColour(border().withAlpha(0.3f));
+            g.drawLine(graphArea.getX(),y,graphArea.getRight(),y,1.0f);
+            g.setColour(muted().withAlpha(0.8f)); g.setFont(juce::FontOptions(8.5f).withStyle("bold"));
+            g.drawText(v<0.f?"FWD":"REV",graphArea.getX()-32.f,y-6.f,28.f,12.f,juce::Justification::right);
+        }
+    } else {
+        // Volume (dB), Pitch and Formant (semitones) share the same +/-12, five-line layout - only
+        // the unit suffix on the label differs.
+        bool isSemitones = currentEditMode==EditMode::Pitch || currentEditMode==EditMode::Formant;
+        for(float v : {-12.f,-6.f,0.f,6.f,12.f}){
+            float y=editValueToY(v);
+            g.setColour(border().withAlpha(v==0.f?0.5f:0.18f));
+            g.drawLine(graphArea.getX(),y,graphArea.getRight(),y,v==0.f?1.3f:1.0f);
+            g.setColour(muted().withAlpha(0.8f)); g.setFont(juce::FontOptions(8.5f));
+            juce::String lbl = (v==0.f?"0":(v>0?"+":"")+juce::String((int)v)) + (isSemitones?"st":"");
+            g.drawText(lbl,graphArea.getX()-30.f,y-6.f,26.f,12.f,juce::Justification::right);
         }
     }
 
@@ -370,8 +520,13 @@ void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
         bool hovered = (i==hoveredEventIndex) && !selected;
         bool activeNow = measureFrac>=ev.position && measureFrac<ev.position+0.05f;
 
-        juce::Colour barColour = activeNow ? sidePeak() : (selected ? accentHighlight() : accent());
-        if(activeNow){
+        juce::Colour barColour;
+        if(currentEditMode==EditMode::Reverse){
+            barColour = ev.reverse ? mid() : muted().withAlpha(0.5f);
+        } else {
+            barColour = activeNow ? sidePeak() : (selected ? accentHighlight() : accent());
+        }
+        if(activeNow && currentEditMode!=EditMode::Reverse){
             g.setColour(sidePeak().withAlpha(0.12f));
             g.fillRoundedRectangle(handle.x-4.f,juce::jmin(baseline,handle.y),8.f,std::abs(handle.y-baseline),3.f);
         }
@@ -389,6 +544,10 @@ void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
                 label=juce::String((int)std::round(ev.position*100.f))+"%";
             } else if(currentEditMode==EditMode::Volume){
                 label=juce::String(ev.volumeDb,1)+" dB";
+            } else if(currentEditMode==EditMode::Pitch){
+                label=(ev.pitchSemitones>0?"+":"")+juce::String(ev.pitchSemitones,1)+" st";
+            } else if(currentEditMode==EditMode::Formant){
+                label=(ev.formantSemitones>0?"+":"")+juce::String(ev.formantSemitones,1)+" st";
             } else {
                 float pv=ev.pan*100.f;
                 label = std::abs(pv)<0.5f ? "C" : (pv<0.f?("L"+juce::String((int)std::round(-pv))):("R"+juce::String((int)std::round(pv))));
@@ -428,7 +587,8 @@ void PDAudioProcessorEditor::drawGraph(juce::Graphics& g) const {
 
     if(!custom){
         g.setColour(muted().withAlpha(0.65f)); g.setFont(juce::FontOptions(10.f));
-        juce::String hint = juce::String("drag nodes to adjust ")+(currentEditMode==EditMode::Volume?"volume":"pan")+" - position is locked";
+        juce::String modeWord = currentEditMode==EditMode::Volume?"volume":(currentEditMode==EditMode::Pan?"pan":(currentEditMode==EditMode::Pitch?"pitch":(currentEditMode==EditMode::Formant?"formant":"reverse")));
+        juce::String hint = "drag nodes to adjust "+modeWord+" - position is locked";
         g.drawText(hint,graphArea.getRight()-260.f,graphArea.getY()+6.f,250.f,16.f,juce::Justification::right);
     }
 }
@@ -470,6 +630,14 @@ void PDAudioProcessorEditor::resized(){
 
     snapBtn.setBounds(w-24-64,by,64,26);
 
-    editorPanelArea = {24.f,120.f,(float)w-48.f,(float)h-120.f-40.f};
+    // FIX (Phase 6): a second row for the new utility buttons - editorPanelArea pushed down to make room.
+    const int by2=by+34;
+    undoBtn.setBounds(24,by2,64,24);
+    redoBtn.setBounds(92,by2,64,24);
+    saveBtn.setBounds(w-24-64*3-16,by2,64,24);
+    loadBtn.setBounds(w-24-64*2-8,by2,64,24);
+    emptyBtn.setBounds(w-24-64,by2,64,24);
+
+    editorPanelArea = {24.f,(float)(by2+32),(float)w-48.f,(float)h-(float)(by2+32)-40.f};
     graphArea = editorPanelArea.reduced(40.f,44.f).withTrimmedBottom(20.f);
 }

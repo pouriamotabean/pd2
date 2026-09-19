@@ -21,6 +21,116 @@ PDAudioProcessor::PDAudioProcessor()
 
 PDAudioProcessor::~PDAudioProcessor(){}
 
+// FIX (Phase 3): adapted from the same phase-vocoder design (and bug fixes) used in PV - correct
+// same-modulus overlap-add, phase accumulation via true-frequency estimation. See the header comment
+// on PitchVocoderEngine for why the window is 512 (not the more typical 2048) for this use case.
+void PDAudioProcessor::PitchVocoderEngine::prepare(){
+    inRing.assign((size_t)N,0.f); outRing.assign((size_t)N,0.f);
+    window.resize((size_t)N); prevPhase.assign((size_t)(N/2+1),0.0); sumPhase.assign((size_t)(N/2+1),0.0);
+    fftIn.resize((size_t)(2*N)); fftOut.resize((size_t)(2*N));
+    magBuf.assign((size_t)(N/2+1),0.f); envBuf.assign((size_t)(N/2+1),0.f); excitBuf.assign((size_t)(N/2+1),0.f);
+    fft=std::make_unique<juce::dsp::FFT>((int)std::log2(N));
+    for(int i=0;i<N;++i) window[(size_t)i]=0.5f-0.5f*std::cos(juce::MathConstants<float>::twoPi*i/(N-1));
+    pos=0;
+}
+void PDAudioProcessor::PitchVocoderEngine::reset(double newPitchRatio, double newFormantRatio){
+    pitchRatio=newPitchRatio; formantRatio=newFormantRatio;
+    std::fill(inRing.begin(),inRing.end(),0.f); std::fill(outRing.begin(),outRing.end(),0.f);
+    std::fill(prevPhase.begin(),prevPhase.end(),0.0); std::fill(sumPhase.begin(),sumPhase.end(),0.0);
+    pos=0;
+}
+float PDAudioProcessor::PitchVocoderEngine::process(float x){
+    inRing[(size_t)pos]=x;
+    const int read=pos;
+    float y=outRing[(size_t)read];
+    outRing[(size_t)read]=0.f;
+
+    if(pos % H==0){
+        for(int i=0;i<N;++i){
+            int idx=(pos-i+N)%N;
+            fftIn[(size_t)(2*i)]=inRing[(size_t)idx]*window[(size_t)i];
+            fftIn[(size_t)(2*i+1)]=0.f;
+        }
+        fft->performRealOnlyForwardTransform(fftIn.data());
+
+        // Pass 1: magnitude per bin (phase is read straight from fftIn again in pass 2 - untouched
+        // by anything formant-related, since formant must never affect WHERE energy ends up, only
+        // how loud each frequency band is).
+        for(int k=0;k<=N/2;++k){
+            const double re=fftIn[(size_t)(2*k)], im=fftIn[(size_t)(2*k+1)];
+            magBuf[(size_t)k]=(float)std::sqrt(re*re+im*im);
+        }
+
+        // FIX (Phase 4): formant envelope extraction + warp - skipped entirely (zero extra cost) when
+        // formant is centred, so Phase 3's pure pitch-shifting is completely unaffected.
+        if(std::abs(formantRatio-1.0)>0.001){
+            const int halfWin=juce::jmax(1,N/64); // smoothing radius in bins - a broad, formant-scale window
+            for(int k=0;k<=N/2;++k){
+                double sum=0.0; int count=0;
+                for(int j=juce::jmax(0,k-halfWin); j<=juce::jmin(N/2,k+halfWin); ++j){ sum+=magBuf[(size_t)j]; ++count; }
+                envBuf[(size_t)k]=(float)(sum/juce::jmax(1,count));
+            }
+            for(int k=0;k<=N/2;++k) excitBuf[(size_t)k]=magBuf[(size_t)k]/(envBuf[(size_t)k]+1e-6f);
+            for(int k=0;k<=N/2;++k){
+                double srcK=(double)k/formantRatio;
+                int k0=juce::jlimit(0,N/2,(int)std::floor(srcK));
+                int k1=juce::jlimit(0,N/2,k0+1);
+                float frac=(float)(srcK-k0);
+                float warpedEnv=envBuf[(size_t)k0]*(1.f-frac)+envBuf[(size_t)k1]*frac;
+                magBuf[(size_t)k]=excitBuf[(size_t)k]*warpedEnv; // overwrite with the formant-shifted magnitude
+            }
+        }
+
+        std::fill(fftOut.begin(), fftOut.end(), 0.0f);
+        const double expected = juce::MathConstants<double>::twoPi * H / N;
+
+        for (int k=0;k<=N/2;++k)
+        {
+            const double re=fftIn[(size_t)(2*k)], im=fftIn[(size_t)(2*k+1)];
+            const double mag=magBuf[(size_t)k]; // possibly formant-warped above - phase still from the original analysis
+            double phase=std::atan2(im,re);
+            double delta=phase-prevPhase[(size_t)k]-expected*k;
+            delta=juce::jlimit(-juce::MathConstants<double>::pi,
+                               juce::MathConstants<double>::pi, delta);
+            const double trueFreq=juce::MathConstants<double>::twoPi*k/N + delta/H;
+            const double newBin=k*pitchRatio;
+            if (newBin <= N/2-2)
+            {
+                const int b=(int)std::floor(newBin);
+                const double frac=newBin-b;
+                const double targetPhase = sumPhase[(size_t)k] + trueFreq*H*pitchRatio;
+                sumPhase[(size_t)k]=targetPhase;
+                prevPhase[(size_t)k]=phase;
+
+                const float a=(float)(mag*std::cos(targetPhase));
+                const float q=(float)(mag*std::sin(targetPhase));
+                fftOut[(size_t)(2*b)] += a*(float)(1-frac); fftOut[(size_t)(2*b+1)] += q*(float)(1-frac);
+                fftOut[(size_t)(2*(b+1))] += a*(float)frac; fftOut[(size_t)(2*(b+1)+1)] += q*(float)frac;
+            }
+        }
+
+        fft->performRealOnlyInverseTransform(fftOut.data());
+        const float norm = 1.0f / (float)(N * 0.5);
+        for (int i=0;i<N;++i)
+        {
+            int idx=(pos+i)%N;
+            outRing[(size_t)idx] += fftOut[(size_t)(2*i)]*window[(size_t)i]*norm;
+        }
+    }
+
+    pos=(pos+1)%N;
+    return y;
+}
+int PDAudioProcessor::checkoutPitchEngine(double pitchRatio, double formantRatio){
+    for(int i=0;i<kPitchPoolSize;++i){
+        if(!pitchPool[(size_t)i].inUse){ pitchPool[(size_t)i].inUse=true; pitchPool[(size_t)i].reset(pitchRatio,formantRatio); return i; }
+    }
+    return -1; // pool exhausted - caller falls back to unshifted playback for this tap rather than blocking/crashing
+}
+void PDAudioProcessor::releasePitchEngine(int slot){
+    if(slot>=0 && slot<kPitchPoolSize) pitchPool[(size_t)slot].inUse=false;
+}
+
 juce::AudioProcessorValueTreeState::ParameterLayout PDAudioProcessor::createParameterLayout(){
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> ps;
     ps.push_back(std::make_unique<juce::AudioParameterBool>(pBypass,"Bypass",false));
@@ -44,6 +154,7 @@ void PDAudioProcessor::prepareToPlay(double sampleRate,int){
     grainWritePos=0; grainArmed=false;
     pendingTaps.clear(); activeTaps.clear();
     samplePosition=0;
+    for(auto& eng:pitchPool){ eng.inUse=false; eng.prepare(); }
 }
 
 // Ground-truth positions from the reference project's MIDI (bar.beat.16th.tick, confirmed via
@@ -101,9 +212,10 @@ void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
         tap.forced=true;
         tap.forcedTotal=juce::jmin(kForceFadeSamples,tap.samplesRemaining);
         for(int k=0;k<tap.forcedTotal;++k){
-            int srcPos=tap.grainReadPos+k;
-            tap.tailL[(size_t)k]= srcPos<grainWritePos ? grainBuffer.getSample(0,srcPos) : 0.f;
-            tap.tailR[(size_t)k]= srcPos<grainWritePos ? grainBuffer.getSample(1,srcPos) : 0.f;
+            int srcPos = tap.reverse ? (tap.totalSamples-1-(tap.grainReadPos+k)) : (tap.grainReadPos+k);
+            bool valid = srcPos>=0 && srcPos<grainWritePos;
+            tap.tailL[(size_t)k]= valid ? grainBuffer.getSample(0,srcPos) : 0.f;
+            tap.tailR[(size_t)k]= valid ? grainBuffer.getSample(1,srcPos) : 0.f;
         }
         tap.grainReadPos=0; tap.samplesRemaining=tap.forcedTotal; tap.totalSamples=tap.forcedTotal;
     }
@@ -115,20 +227,21 @@ void PDAudioProcessor::scheduleTapsForTrigger(juce::int64 triggerSample){
     double measureSec = (60.0/juce::jmax(1.0,bpm)) * juce::jmax(1,num);
     juce::int64 measureSamples=(juce::int64)std::round(measureSec*sr);
 
-    struct Sortable { float position; float gain; float pan; };
+    struct Sortable { float position; float gain; float pan; float pitchSemitones; float formantSemitones; bool reverse; };
     std::vector<Sortable> sorted;
     sorted.reserve((size_t)pat.count);
     for(int i=0;i<pat.count;++i){
         const auto& e=pat.events[i];
         if(!e.enabled) continue;
         float gain=juce::Decibels::decibelsToGain(juce::jlimit(-12.f,12.f,e.volumeDb));
-        sorted.push_back({juce::jlimit(0.f,1.f,e.position),gain,juce::jlimit(-1.f,1.f,e.pan)});
+        sorted.push_back({juce::jlimit(0.f,1.f,e.position),gain,juce::jlimit(-1.f,1.f,e.pan),
+                           juce::jlimit(-12.f,12.f,e.pitchSemitones),juce::jlimit(-12.f,12.f,e.formantSemitones),e.reverse});
     }
     std::sort(sorted.begin(),sorted.end(),[](const Sortable&a,const Sortable&b){return a.position<b.position;});
 
     for(auto& s:sorted){
         juce::int64 off=(juce::int64)std::round((double)s.position*(double)measureSamples);
-        pendingTaps.push_back({triggerSample+off,s.gain,s.pan,triggerSample,0});
+        pendingTaps.push_back({triggerSample+off,s.gain,s.pan,s.pitchSemitones,s.formantSemitones,s.reverse,triggerSample,0});
     }
     for(size_t i=0;i<pendingTaps.size();++i){
         if(i+1<pendingTaps.size()){
@@ -184,7 +297,28 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                 int availableSoFar=(int)(absSample-pendingTaps[t].triggerSample);
                 juce::int64 cap64=juce::jmin((juce::int64)desiredGrainSamples,pendingTaps[t].maxLenSamples);
                 int len=juce::jlimit(0,(int)cap64,availableSoFar);
-                if(len>0) activeTaps.push_back({0,len,len,pendingTaps[t].gain,pendingTaps[t].pan});
+                if(len>0){
+                    ActiveTap newTap;
+                    newTap.grainReadPos=0; newTap.samplesRemaining=len; newTap.totalSamples=len;
+                    newTap.gain=pendingTaps[t].gain; newTap.pan=pendingTaps[t].pan; newTap.reverse=pendingTaps[t].reverse;
+                    // FIX (Phase 3/4): only touch the pool for taps that actually need shifting - the
+                    // common case (pitch==0 AND formant==0) plays the raw grain exactly as every phase
+                    // before this one did, byte-for-byte, at zero extra CPU cost.
+                    if(std::abs(pendingTaps[t].pitchSemitones)>0.01f || std::abs(pendingTaps[t].formantSemitones)>0.01f){
+                        double pitchRatio=std::pow(2.0,(double)pendingTaps[t].pitchSemitones/12.0);
+                        double formantRatio=std::pow(2.0,(double)pendingTaps[t].formantSemitones/12.0);
+                        newTap.pvL=checkoutPitchEngine(pitchRatio,formantRatio);
+                        newTap.pvR=checkoutPitchEngine(pitchRatio,formantRatio);
+                        if(newTap.pvL<0 || newTap.pvR<0){
+                            // Pool exhausted (very heavy simultaneous pitch/formant-shifted repeats) -
+                            // release whichever slot WAS granted and fall back to unshifted playback
+                            // for this one tap, rather than blocking or crashing.
+                            releasePitchEngine(newTap.pvL); releasePitchEngine(newTap.pvR);
+                            newTap.pvL=-1; newTap.pvR=-1;
+                        }
+                    }
+                    activeTaps.push_back(newTap);
+                }
                 pendingTaps.erase(pendingTaps.begin()+(long)t);
             } else ++t;
         }
@@ -209,10 +343,18 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                     outR += tap.tailR[(size_t)tap.grainReadPos]*tap.gain*ramp*panGainR;
                     ++tap.grainReadPos; --tap.samplesRemaining;
                 }
-                if(tap.samplesRemaining<=0) activeTaps.erase(activeTaps.begin()+(long)t); else ++t;
+                if(tap.samplesRemaining<=0){ releasePitchEngine(tap.pvL); releasePitchEngine(tap.pvR); activeTaps.erase(activeTaps.begin()+(long)t); } else ++t;
                 continue;
             }
-            if(tap.grainReadPos<grainWritePos && tap.samplesRemaining>0){
+            // FIX (Phase 5): a reversed tap reads the SAME captured window [0, totalSamples) as a
+            // forward tap, just back-to-front - at playback-progress 0 it reads the most recently
+            // captured sample in its window, ending on the sample closest to the trigger. Since that
+            // whole window was captured before this tap even started reading (see the "next tap
+            // distance" cap and the trigger-time availability check that fixed totalSamples in the
+            // first place), the reversed index is always safely behind grainWritePos too - no separate
+            // synchronization case needed.
+            int readIdx = tap.reverse ? (tap.totalSamples-1-tap.grainReadPos) : tap.grainReadPos;
+            if(readIdx>=0 && readIdx<grainWritePos && tap.samplesRemaining>0){
                 float fade=1.f;
                 int fadeLen=juce::jmin(kFadeSamples,tap.totalSamples/2);
                 int posIntoTap=tap.totalSamples-tap.samplesRemaining;
@@ -220,11 +362,13 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                     if(posIntoTap<fadeLen) fade=0.5f-0.5f*std::cos(juce::MathConstants<float>::pi*(float)posIntoTap/(float)fadeLen);
                     else if(tap.samplesRemaining<=fadeLen) fade=0.5f-0.5f*std::cos(juce::MathConstants<float>::pi*(float)tap.samplesRemaining/(float)fadeLen);
                 }
-                float gL=grainBuffer.getSample(0,tap.grainReadPos), gR=grainBuffer.getSample(1,tap.grainReadPos);
+                float gL=grainBuffer.getSample(0,readIdx), gR=grainBuffer.getSample(1,readIdx);
+                if(tap.pvL>=0) gL=pitchPool[(size_t)tap.pvL].process(gL);
+                if(tap.pvR>=0) gR=pitchPool[(size_t)tap.pvR].process(gR);
                 outL += gL*tap.gain*fade*panGainL; outR += gR*tap.gain*fade*panGainR;
                 ++tap.grainReadPos; --tap.samplesRemaining;
             }
-            if(tap.samplesRemaining<=0) activeTaps.erase(activeTaps.begin()+(long)t); else ++t;
+            if(tap.samplesRemaining<=0){ releasePitchEngine(tap.pvL); releasePitchEngine(tap.pvR); activeTaps.erase(activeTaps.begin()+(long)t); } else ++t;
         }
 
         b.setSample(0,i,outL); b.setSample(1,i,outR);

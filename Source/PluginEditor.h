@@ -53,7 +53,7 @@ private:
     // VOLUME or PAN so far. Adding a mode is: one entry in EditMode, one branch in getEditValue/
     // setEditValue/editValueRange, and a button - the drag/hit-test/paint code is entirely generic
     // and doesn't change per mode.
-    enum class EditMode { Volume, Pan };
+    enum class EditMode { Volume, Pan, Pitch, Formant, Reverse };
     EditMode currentEditMode=EditMode::Volume;
     float getEditValue(const PDAudioProcessor::RepeatEvent&) const;      // reads the field the current mode represents, in DISPLAY units
     void setEditValue(PDAudioProcessor::RepeatEvent&, float displayValue) const; // writes it back, clamped to that mode's range
@@ -105,6 +105,31 @@ private:
     static juce::Colour accent(){return juce::Colour(0xff296095);}
     static juce::Colour accentHighlight(){return juce::Colour(0xff69a1d0);}
     static juce::Colour sidePeak(){return juce::Colour(0xff96c8f2);}
+    static juce::Colour mid(){return juce::Colour(0xffd8b52a);} // FIX (Phase 5): warm colour reserved for the Reverse indicator, distinct from every cool blue used elsewhere so it never gets confused with hover/selection
+
+    // FIX (Phase 6 - undo/redo): a separate history stack PER PRESET, so switching presets never lets
+    // you undo an edit that belongs to a different one. A new state is pushed at the START of a
+    // gesture (mouseDown, or right before a delete) - so one undo step always corresponds to one whole
+    // user action (a full drag, a create, a delete, a reverse-toggle), never one pixel of a drag.
+    std::array<std::vector<PDAudioProcessor::RepeatPattern>,3> undoStacks, redoStacks;
+    static constexpr int kMaxUndoDepth=50;
+    void pushUndoState(); // call BEFORE mutating workingPattern
+    void performUndo();
+    void performRedo();
+    juce::TextButton undoBtn{"UNDO"}, redoBtn{"REDO"};
+    void updateUndoRedoButtonStates();
+
+    // FIX (Phase 6 - preset persistence beyond the DAW project): Save/Load write the CURRENT preset's
+    // pattern to/from a small file on disk (juce::FileChooser), so a pattern can be reused across
+    // different projects/instances, not just recalled within the one project it was drawn in. Empty
+    // is context-sensitive: for Custom it clears every repeat; for the position-locked Forward/Reverse
+    // presets (which can never be emptied of repeats - their positions are fixed) it resets every
+    // repeat's VALUES back to their neutral defaults instead.
+    juce::TextButton saveBtn{"SAVE"}, loadBtn{"LOAD"}, emptyBtn{"EMPTY"};
+    std::unique_ptr<juce::FileChooser> activeFileChooser; // must outlive the async chooser callback
+    void doSavePattern();
+    void doLoadPattern();
+    void doEmptyPattern();
 
     void drawPremiumPanel(juce::Graphics&, juce::Rectangle<float> bounds, float radius) const;
     void drawHeader(juce::Graphics&) const;
