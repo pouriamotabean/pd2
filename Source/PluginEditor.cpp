@@ -381,6 +381,22 @@ void PDAudioProcessorEditor::mouseMove(const juce::MouseEvent& e){
 void PDAudioProcessorEditor::mouseExit(const juce::MouseEvent&){
     if(hoveredEventIndex!=-1){ hoveredEventIndex=-1; repaint(); }
 }
+void PDAudioProcessorEditor::mouseDoubleClick(const juce::MouseEvent& e){
+    // FIX (requested): double-clicking a node resets it back to the neutral default for whichever
+    // edit mode is currently active - 0 for Volume/Pan/Pitch/Formant, "not reversed" for Reverse.
+    // Works on all three presets (Forward/Reverse included), matching how single-click value editing
+    // already works everywhere - only position/creation/deletion are Custom-only.
+    int h=hitTestHandle(e.position);
+    if(h<0) return;
+    refreshWorkingPatternFromProcessor();
+    pushUndoState();
+    auto& ev=workingPattern.events[h];
+    if(currentEditMode==EditMode::Reverse) ev.reverse=false;
+    else setEditValue(ev,0.f);
+    commitWorkingPattern();
+    selectedEventIndex=h;
+    repaint();
+}
 bool PDAudioProcessorEditor::keyPressed(const juce::KeyPress& k){
     // FIX (Phase 6): standard Undo/Redo shortcuts, in addition to the visible UNDO/REDO buttons.
     if(k==juce::KeyPress('z',juce::ModifierKeys::commandModifier,0)){ performUndo(); return true; }
