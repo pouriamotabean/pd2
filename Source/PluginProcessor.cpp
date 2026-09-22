@@ -315,22 +315,6 @@ void PDAudioProcessor::processBlock(juce::AudioBuffer<float>& b,juce::MidiBuffer
                             // for this one tap, rather than blocking or crashing.
                             releasePitchEngine(newTap.pvL); releasePitchEngine(newTap.pvR);
                             newTap.pvL=-1; newTap.pvR=-1;
-                        } else {
-                            // FIX (real bug found in review - very likely why Pitch/Formant produced no
-                            // audible effect): a freshly-reset vocoder's ring buffer is all zero, so its
-                            // FIRST analysis window is mostly silence - for a tap shorter than or close
-                            // to N (512 samples, ~11.6ms), the shifted output can be negligible or never
-                            // arrive at all before the tap ends. Since this tap's own audio is already
-                            // fully captured (that's what "len" IS), we can pre-feed the engine with it
-                            // once, discarding the (meaningless, cold-start) output, so its ring buffer
-                            // already holds real audio before real playback starts from position 0.
-                            int primeCount=juce::jmin(PitchVocoderEngine::N,len);
-                            for(int k=0;k<primeCount;++k){
-                                int srcIdx = newTap.reverse ? (len-1-k) : k;
-                                if(srcIdx<0 || srcIdx>=grainWritePos) break; // never read uncaptured/stale data
-                                pitchPool[(size_t)newTap.pvL].process(grainBuffer.getSample(0,srcIdx));
-                                pitchPool[(size_t)newTap.pvR].process(grainBuffer.getSample(1,srcIdx));
-                            }
                         }
                     }
                     activeTaps.push_back(newTap);
